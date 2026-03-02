@@ -1,0 +1,7 @@
+# Dataset and data folders
+dataset-sdv-feb23/
+dataset-sdv-feb28/
+glautolab.egg-info/
+.venv-glautolab/
+.venv/
+uv.lock

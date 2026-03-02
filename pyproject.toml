@@ -1,0 +1,32 @@
+[project]
+name = "glautolab"
+version = "0.1.0"
+description = "GLAutoLab - OpenGL visualization and vison processing"
+readme = "README.md"
+requires-python = "==3.10.*"
+
+dependencies = [
+  "numpy==1.26.4",
+  "opencv-python>=4.8.0",
+  "scikit-learn",
+  "Pillow",
+  "rerun-sdk==0.19.0",
+  "pyyaml",
+  "PyOpenGL",
+  "PyOpenGL-accelerate",
+  "glfw",
+  "imgui[glfw]",
+  "tqdm",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv.extra-build-dependencies]
+mmcv = ["setuptools<70", "wheel"]
+
+
+[tool.setuptools.packages.find]
+include = ["vizModule*"]
+exclude = ["images*", "docs*", "tests*", "__pycache__*"]

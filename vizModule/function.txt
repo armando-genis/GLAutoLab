@@ -1,0 +1,36 @@
+in the ipmmodule.py could work:
+
+
+    # set the BEV parameters directly in meters
+    def set_bev_parameters(self):
+        # ---- Metric extent of BEV ----
+        self.bev_forward_m = 40.0     # meters forward
+        self.bev_backward_m = 10.0    # meters backward
+        self.bev_left_m = 20.0        # meters left
+        self.bev_right_m = 20.0       # meters right
+
+        # ---- Resolution ----
+        self.meters_per_pixel = 0.1   # 10 cm per pixel
+
+        # Compute output resolution
+        width_m = self.bev_left_m + self.bev_right_m
+        height_m = self.bev_forward_m + self.bev_backward_m
+
+        self.outputRes = (
+            int(height_m / self.meters_per_pixel),
+            int(width_m / self.meters_per_pixel)
+        )
+
+        # Pixels per meter
+        self.pxPerM = (
+            1.0 / self.meters_per_pixel,
+            1.0 / self.meters_per_pixel
+        )
+
+        # Build plane mapping matrix M directly
+        self.M = np.array([
+            [1.0 / self.pxPerM[1], 0.0, -self.bev_left_m],
+            [0.0, -1.0 / self.pxPerM[0], self.bev_forward_m],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float32)
