@@ -19,6 +19,7 @@ from UlitysModule import Cube, draw_axes
 from CameraLidarModule import CameraLidarModule
 from carModelModule import CarModel
 from ipmModule import IpmModule, TexturedPlane, HDMapBoundaryAccumulator, HDMapGridAccumulator
+from personDetectionModule import PersonDetectionModule
 
 # ==============================
 # Shaders
@@ -694,6 +695,9 @@ class Viz:
         self._last_size = (0, 0)
         self._proj = None
 
+        self._person_detection_module = PersonDetectionModule()
+        self._person_detection_module.load_camera_lidar_parameters(dataset)
+
     def _set_model_color(self, model_matrix, r, g, b, a=1.0):
         glUseProgram(self._program)
         glUniformMatrix4fv(self._model_loc, 1, GL_FALSE, model_matrix.T)
@@ -1031,13 +1035,21 @@ class Viz:
                         center = center.reshape(-1, 2)
                     if center.shape[1] == 2:
                         center = np.concatenate([center, np.zeros((len(center), 1), dtype=np.float32)], axis=1)
-                    left, right = self._hd_grid_acc.compute_left_right_from_centerline(
-                        center,
-                        lane_width=4.0  # meters
-                    )
+
+                    if self._polys:
+                        poly = self._polys[0]  # assuming single drivable region
+
+                        left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
+                            polygon_world=poly,
+                            centerline_world=np.asarray(self._pose.path_positions, dtype=np.float32)
+                        )
+
                     self._path_center = center
                     self._path_left = left
                     self._path_right = right
+
+                # person detection
+                self._person_detection_module.get_camera_images(self._current_images)
 
             # only if true, color the pointcloud with the rgb images (undistorted)
             if self._ui.show_colored_points:

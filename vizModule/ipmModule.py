@@ -207,7 +207,6 @@ class IpmModule:
         birdsEyeView = birdsEyeView / count[..., None]
         birdsEyeView = np.clip(birdsEyeView, 0, 255).astype(np.uint8)
 
-
         if not warped_masks:
             return birdsEyeView, valid_mask_final, None
 
@@ -817,15 +816,29 @@ class HDMapGridAccumulator:
         self._polygon_spheres.build_from_positions_direct(all_marker_points)
 
     def sync_sphere_to_polygon(self, sphere_index: int):
-        """Push the current sphere position back to the editable polygon so the polygon moves with the drag."""
+
         if sphere_index < 0 or sphere_index >= len(self._sphere_to_poly):
             return
+
         poly_idx, point_idx = self._sphere_to_poly[sphere_index]
-        if poly_idx >= len(self._polygons_editable) or point_idx >= len(self._polygons_editable[poly_idx]):
+
+        if poly_idx >= len(self._polygons_editable):
             return
+
+        poly = self._polygons_editable[poly_idx]
+
+        if point_idx >= len(poly):
+            return
+
         center = self._polygon_spheres._centers[sphere_index].copy()
-        center[2] = 0.0  # keep polygon in z=0 plane
-        self._polygons_editable[poly_idx][point_idx] = center
+        center[2] = 0.0
+
+        # 1️⃣ update moved vertex
+        poly[point_idx] = center
+
+        # 2️⃣ smooth only local neighborhood
+        self._smooth_local_segment(poly, point_idx, radius=2)
+
         self._polygons_edited = True
 
     def sync_all_spheres_to_polygons(self):
@@ -894,6 +907,8 @@ class HDMapGridAccumulator:
             if poly is None or len(poly) < 3:
                 continue
 
+            poly = self._interpolate_closed_curve(poly, samples_per_seg=8)
+
             # World -> grid
             gx = np.floor((poly[:, 0] - self.origin_x) / self.res).astype(np.int32)
             gy = np.floor((poly[:, 1] - self.origin_y) / self.res).astype(np.int32)
@@ -923,6 +938,70 @@ class HDMapGridAccumulator:
 
     def draw_polygon_spheres(self, view: np.ndarray, projection: np.ndarray):
         self._polygon_spheres.draw(view, projection)
+
+    def _smooth_local_segment(
+        self,
+        poly: np.ndarray,
+        center_idx: int,
+        radius: int = 2
+    ):
+        """
+        Smooth only a local window around center_idx.
+        radius = how many neighbors on each side.
+        """
+
+        N = len(poly)
+        if N < 3:
+            return
+
+        # copy to avoid progressive distortion
+        original = poly.copy()
+
+        for k in range(-radius, radius + 1):
+            idx = (center_idx + k) % N
+
+            acc = np.zeros(3, dtype=np.float32)
+            count = 0
+
+            for j in range(-radius, radius + 1):
+                neighbor = (idx + j) % N
+                acc += original[neighbor]
+                count += 1
+
+            poly[idx] = acc / count
+
+    def _interpolate_closed_curve(self, poly: np.ndarray, samples_per_seg: int = 10):
+        """
+        Generate smooth closed curve using Catmull-Rom spline.
+        Returns dense polygon.
+        """
+
+        N = len(poly)
+        if N < 4:
+            return poly
+
+        dense = []
+
+        for i in range(N):
+            p0 = poly[(i - 1) % N]
+            p1 = poly[i]
+            p2 = poly[(i + 1) % N]
+            p3 = poly[(i + 2) % N]
+
+            for t in np.linspace(0, 1, samples_per_seg, endpoint=False):
+                t2 = t * t
+                t3 = t2 * t
+
+                point = 0.5 * (
+                    (2 * p1)
+                    + (-p0 + p2) * t
+                    + (2*p0 - 5*p1 + 4*p2 - p3) * t2
+                    + (-p0 + 3*p1 - 3*p2 + p3) * t3
+                )
+
+                dense.append(point)
+
+        return np.asarray(dense, dtype=np.float32)
 
     def compute_left_right_from_centerline(
         self,
@@ -959,3 +1038,62 @@ class HDMapGridAccumulator:
         right = np.concatenate([right_xy, np.zeros((len(right_xy), 1))], axis=1)
 
         return left.astype(np.float32), right.astype(np.float32)
+
+    def split_polygon_left_right_from_centerline(
+        self,
+        polygon_world: np.ndarray,
+        centerline_world: np.ndarray,
+    ):
+        """
+        polygon_world: Nx3 boundary from extract_polygons()
+        centerline_world: Mx3 route polyline
+
+        Returns:
+            left_boundary (Kx3)
+            right_boundary (Lx3)
+        """
+
+        if polygon_world is None or centerline_world is None:
+            return None, None
+
+        if len(polygon_world) < 3 or len(centerline_world) < 3:
+            return None, None
+
+        poly = polygon_world[:, :2]
+        center = centerline_world[:, :2]
+
+        # Precompute centerline tangents
+        d = np.gradient(center, axis=0)
+        dn = np.linalg.norm(d, axis=1, keepdims=True) + 1e-6
+        tangents = d / dn
+
+        left_pts = []
+        right_pts = []
+
+        for p in poly:
+
+            # find closest centerline point
+            dist2 = np.sum((center - p) ** 2, axis=1)
+            idx = np.argmin(dist2)
+
+            c = center[idx]
+            t = tangents[idx]
+
+            # vector from centerline to polygon point
+            v = p - c
+
+            # 2D cross product (z-component)
+            cross = t[0] * v[1] - t[1] * v[0]
+
+            if cross > 0:
+                left_pts.append([p[0], p[1], 0.0])
+            else:
+                right_pts.append([p[0], p[1], 0.0])
+
+        if len(left_pts) < 2 or len(right_pts) < 2:
+            return None, None
+
+        return (
+            np.asarray(left_pts, dtype=np.float32),
+            np.asarray(right_pts, dtype=np.float32),
+        )
