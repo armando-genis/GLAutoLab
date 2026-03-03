@@ -441,6 +441,7 @@ class SceneUI:
         self._add_box_request = False
         self._remove_box_request = False
         self._delete_selected_request = False
+        self._live_topic_mode = False  # when True: no selection, minimal UI; toggle with button
 
     def load_images_for_scene(self, idx):
         self._textures.clear()
@@ -487,6 +488,9 @@ class SceneUI:
             self._needs_reload = True
 
         imgui.text(f"Scene: {self.current_scene}")
+
+        if imgui.button("Live Topic Trigger"):
+            self._live_topic_mode = not self._live_topic_mode
 
         imgui.separator()
 
@@ -800,11 +804,13 @@ class Viz:
                         inv_proj, inv_view, cam_pos_world
                     )
 
-                    polygon_result = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos, ray_dir)
-                    if polygon_result is not None:
-                        polygon_idx, _ = polygon_result
-                        self._hd_grid_acc._polygon_spheres.select(polygon_idx)
-                        self._hd_grid_acc._polygon_spheres.begin_drag(cam_pos, ray_dir)
+                    if not self._ui._live_topic_mode:
+
+                        polygon_result = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos, ray_dir)
+                        if polygon_result is not None:
+                            polygon_idx, _ = polygon_result
+                            self._hd_grid_acc._polygon_spheres.select(polygon_idx)
+                            self._hd_grid_acc._polygon_spheres.begin_drag(cam_pos, ray_dir)
 
                 # -----------------------------
                 # LEFT RELEASE (click select OR finish drag)
@@ -824,58 +830,61 @@ class Viz:
                             inv_proj, inv_view, cam_pos_world
                         )
 
-                        # bring ray into lidar frame so label.intersect_ray works correctly
-                        inv_lidar = np.linalg.inv(self._lidar_model)
-                        cam_pos_l = (inv_lidar @ np.append(cam_pos, 1.0))[:3]
-                        ray_dir_l = (inv_lidar @ np.append(ray_dir, 0.0))[:3]
-                        n = np.linalg.norm(ray_dir_l)
-                        if n > 1e-8:
-                            ray_dir_l /= n
+                        if not self._ui._live_topic_mode:
 
-                        closest_label = None
-                        min_label_t = float("inf")
+                            # bring ray into lidar frame so label.intersect_ray works correctly
+                            inv_lidar = np.linalg.inv(self._lidar_model)
+                            cam_pos_l = (inv_lidar @ np.append(cam_pos, 1.0))[:3]
+                            ray_dir_l = (inv_lidar @ np.append(ray_dir, 0.0))[:3]
+                            n = np.linalg.norm(ray_dir_l)
+                            if n > 1e-8:
+                                ray_dir_l /= n
 
-                        for i, label in enumerate(self._labels.labels()):
-                            t = label.intersect_ray(cam_pos_l, ray_dir_l)
-                            if t is not None and t < min_label_t:
-                                min_label_t = t
-                                closest_label = i
+                            closest_label = None
+                            min_label_t = float("inf")
 
-                        # pose sphere pick (world ray)
-                        sphere_result = self._pose._marker_renderer.intersect_ray(cam_pos, ray_dir)
-                        if sphere_result is not None:
-                            sphere_idx, sphere_t = sphere_result
-                        else:
-                            sphere_idx, sphere_t = None, float("inf")
+                            for i, label in enumerate(self._labels.labels()):
+                                t = label.intersect_ray(cam_pos_l, ray_dir_l)
+                                if t is not None and t < min_label_t:
+                                    min_label_t = t
+                                    closest_label = i
 
-                        # polygon sphere pick (world ray)
-                        polygon_result = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos, ray_dir)
-                        if polygon_result is not None:
-                            polygon_idx, polygon_t = polygon_result
-                        else:
-                            polygon_idx, polygon_t = None, float("inf")
+                            # pose sphere pick (world ray)
+                            sphere_result = self._pose._marker_renderer.intersect_ray(cam_pos, ray_dir)
+                            if sphere_result is not None:
+                                sphere_idx, sphere_t = sphere_result
+                            else:
+                                sphere_idx, sphere_t = None, float("inf")
 
-                        # selection priority (same as your logic)
-                        if sphere_idx is not None and sphere_t < min_label_t and sphere_t < polygon_t:
-                            self._pose._marker_renderer.select(sphere_idx)
-                        elif polygon_idx is not None and polygon_t < min_label_t and polygon_t < sphere_t:
-                            self._hd_grid_acc._polygon_spheres.select(polygon_idx)
-                        elif closest_label is not None:
-                            self._labels.select(closest_label)
-                            self._labels_dirty = True
+                            # polygon sphere pick (world ray)
+                            polygon_result = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos, ray_dir)
+                            if polygon_result is not None:
+                                polygon_idx, polygon_t = polygon_result
+                            else:
+                                polygon_idx, polygon_t = None, float("inf")
 
-                    # Finish polygon drag (if any) + bake grid once on release
-                    drag_idx = self._hd_grid_acc._polygon_spheres._selected_index
-                    was_dragging = self._hd_grid_acc._polygon_spheres._dragging
+                            # selection priority (same as your logic)
+                            if sphere_idx is not None and sphere_t < min_label_t and sphere_t < polygon_t:
+                                self._pose._marker_renderer.select(sphere_idx)
+                            elif polygon_idx is not None and polygon_t < min_label_t and polygon_t < sphere_t:
+                                self._hd_grid_acc._polygon_spheres.select(polygon_idx)
+                            elif closest_label is not None:
+                                self._labels.select(closest_label)
+                                self._labels_dirty = True
 
-                    self._hd_grid_acc._polygon_spheres.end_drag()
+                    # Finish polygon drag (if any) + bake grid once on release (only when releasing)
+                    if not self._ui._live_topic_mode:
+                        drag_idx = self._hd_grid_acc._polygon_spheres._selected_index
+                        was_dragging = self._hd_grid_acc._polygon_spheres._dragging
 
-                    if was_dragging and drag_idx >= 0:
-                        # ensure final position is committed
-                        self._hd_grid_acc.sync_sphere_to_polygon(drag_idx)
-                        self._hd_grid_acc.rasterize_edited_polygons_to_grid()
-                        rgba = self._hd_grid_acc.to_rgba(alpha_scale=220)
-                        self._hd_grid_plane.set_texture_rgba(rgba)
+                        self._hd_grid_acc._polygon_spheres.end_drag()
+
+                        if was_dragging and drag_idx >= 0:
+                            # ensure final position is committed
+                            self._hd_grid_acc.sync_sphere_to_polygon(drag_idx)
+                            self._hd_grid_acc.rasterize_edited_polygons_to_grid()
+                            rgba = self._hd_grid_acc.to_rgba(alpha_scale=220)
+                            self._hd_grid_plane.set_texture_rgba(rgba)
 
                     self._mouse_pressed = False
 
@@ -883,7 +892,7 @@ class Viz:
                 # DRAG behavior (either sphere drag OR camera orbit/pan)
                 # -----------------------------
                 if left_pressed:
-                    if self._hd_grid_acc._polygon_spheres._dragging:
+                    if self._hd_grid_acc._polygon_spheres._dragging and not self._ui._live_topic_mode:
                         # Only compute ray while dragging a polygon sphere
                         inv_proj = np.linalg.inv(proj)
                         inv_view = np.linalg.inv(view)
@@ -927,287 +936,315 @@ class Viz:
                 speed = 0.05
                 moved = False
 
-                # ESC: release polygon edit (deselect sphere, end drag, allow HD map to update again)
-                if glfw.get_key(self._window, glfw.KEY_ESCAPE) == glfw.PRESS:
-                    self._hd_grid_acc._polygon_spheres.end_drag()
-                    self._hd_grid_acc._polygon_spheres.select(-1)
-                    self._hd_grid_acc.clear_polygon_edits()
+                if not self._ui._live_topic_mode:
 
-                if glfw.get_key(self._window, glfw.KEY_UP) == glfw.PRESS:
-                    self._labels.move_selected_local(speed, 0, 0); moved = True
+                    # ESC: release polygon edit (deselect sphere, end drag, allow HD map to update again)
+                    if glfw.get_key(self._window, glfw.KEY_ESCAPE) == glfw.PRESS:
+                        self._hd_grid_acc._polygon_spheres.end_drag()
+                        self._hd_grid_acc._polygon_spheres.select(-1)
+                        self._hd_grid_acc.clear_polygon_edits()
 
-                if glfw.get_key(self._window, glfw.KEY_DOWN) == glfw.PRESS:
-                    self._labels.move_selected_local(-speed, 0, 0); moved = True
+                    if glfw.get_key(self._window, glfw.KEY_UP) == glfw.PRESS:
+                        self._labels.move_selected_local(speed, 0, 0); moved = True
 
-                if glfw.get_key(self._window, glfw.KEY_LEFT) == glfw.PRESS:
-                    self._labels.move_selected_local(0, speed, 0); moved = True
+                    if glfw.get_key(self._window, glfw.KEY_DOWN) == glfw.PRESS:
+                        self._labels.move_selected_local(-speed, 0, 0); moved = True
 
-                if glfw.get_key(self._window, glfw.KEY_RIGHT) == glfw.PRESS:
-                    self._labels.move_selected_local(0, -speed, 0); moved = True
+                    if glfw.get_key(self._window, glfw.KEY_LEFT) == glfw.PRESS:
+                        self._labels.move_selected_local(0, speed, 0); moved = True
 
-                if glfw.get_key(self._window, glfw.KEY_PAGE_UP) == glfw.PRESS:
-                    self._labels.move_selected(0, 0, speed); moved = True
+                    if glfw.get_key(self._window, glfw.KEY_RIGHT) == glfw.PRESS:
+                        self._labels.move_selected_local(0, -speed, 0); moved = True
 
-                if glfw.get_key(self._window, glfw.KEY_PAGE_DOWN) == glfw.PRESS:
-                    self._labels.move_selected(0, 0, -speed); moved = True
+                    if glfw.get_key(self._window, glfw.KEY_PAGE_UP) == glfw.PRESS:
+                        self._labels.move_selected(0, 0, speed); moved = True
 
-                if glfw.get_key(self._window, glfw.KEY_W) == glfw.PRESS:
-                    self._labels.move_selected(0, 0, speed); moved = True
+                    if glfw.get_key(self._window, glfw.KEY_PAGE_DOWN) == glfw.PRESS:
+                        self._labels.move_selected(0, 0, -speed); moved = True
 
-                if glfw.get_key(self._window, glfw.KEY_S) == glfw.PRESS:
-                    self._labels.move_selected(0, 0, -speed); moved = True
+                    if glfw.get_key(self._window, glfw.KEY_W) == glfw.PRESS:
+                        self._labels.move_selected(0, 0, speed); moved = True
 
-                if glfw.get_key(self._window, glfw.KEY_A) == glfw.PRESS:
-                    self._labels.rotate_selected(0.02); moved = True
+                    if glfw.get_key(self._window, glfw.KEY_S) == glfw.PRESS:
+                        self._labels.move_selected(0, 0, -speed); moved = True
 
-                if glfw.get_key(self._window, glfw.KEY_D) == glfw.PRESS:
-                    self._labels.rotate_selected(-0.02); moved = True
+                    if glfw.get_key(self._window, glfw.KEY_A) == glfw.PRESS:
+                        self._labels.rotate_selected(0.02); moved = True
 
-                if moved:
+                    if glfw.get_key(self._window, glfw.KEY_D) == glfw.PRESS:
+                        self._labels.rotate_selected(-0.02); moved = True
+
+                    if moved:
+                        self._labels_dirty = True
+
+            if not self._ui._live_topic_mode:
+
+                if self._dataset is not None and self._ui.consume_reload_flag():
+                    # reload scene
+                    idx = self._ui.get_current_index()
+                    # set labels for scene
+                    self._labels.set_scene(idx)
+                    # load lidar for scene
+                    xyz = self._dataset.load_lidar(idx)
+                    self._pointcloud.update(xyz)
+                    # load images for scene
+                    self._ui.load_images_for_scene(idx)
+                    self._current_images = self._ui._undistorted_images
+                    self._current_raw_images = self._ui._raw_images
+                    self._current_images_mask = self._ui._images_mask
+                    # paint pointcloud with the rgb images (undistorted)
+                    if self._ui.show_colored_points:
+                        self._camera_lidar_module.start_colored_pointcloud(
+                            lidar_xyz=xyz,
+                            images=self._current_images,
+                        )
+                    # pose of the scene (location, heading, roll, pitch) of the ego vehicle
+                    result = self._dataset.load_pose(idx)
+                    if result is not None:
+                        location, heading, roll, pitch = result
+                        self._pose.update(location, heading, roll, pitch)
+                        # set the lidar ego pose matrix based on the currect pose of the scene
+                        self._lidar_model = Viz._pose_to_matrix(location, heading, roll, pitch)
+                        self._basefootprint_model = self._car_model.get_basefootprint_frame(self._lidar_model)
+                    else:
+                        self._lidar_model = np.identity(4, dtype=np.float32)
+                        self._basefootprint_model = np.identity(4, dtype=np.float32)
                     self._labels_dirty = True
 
-
-            if self._dataset is not None and self._ui.consume_reload_flag():
-                # reload scene
-                idx = self._ui.get_current_index()
-                # set labels for scene
-                self._labels.set_scene(idx)
-                # load lidar for scene
-                xyz = self._dataset.load_lidar(idx)
-                self._pointcloud.update(xyz)
-                # load images for scene
-                self._ui.load_images_for_scene(idx)
-                self._current_images = self._ui._undistorted_images
-                self._current_raw_images = self._ui._raw_images
-                self._current_images_mask = self._ui._images_mask
-                # paint pointcloud with the rgb images (undistorted)
-                if self._ui.show_colored_points:
-                    self._camera_lidar_module.start_colored_pointcloud(
-                        lidar_xyz=xyz,
-                        images=self._current_images,
-                    )
-                # pose of the scene (location, heading, roll, pitch) of the ego vehicle
-                result = self._dataset.load_pose(idx)
-                if result is not None:
-                    location, heading, roll, pitch = result
-                    self._pose.update(location, heading, roll, pitch)
-                    # set the lidar ego pose matrix based on the currect pose of the scene
-                    self._lidar_model = Viz._pose_to_matrix(location, heading, roll, pitch)
-                    self._basefootprint_model = self._car_model.get_basefootprint_frame(self._lidar_model)
-                else:
-                    self._lidar_model = np.identity(4, dtype=np.float32)
-                    self._basefootprint_model = np.identity(4, dtype=np.float32)
-                self._labels_dirty = True
-
-                # draw the path on the images
-                self._path_images = self._label_camera_mgr.bake_path_on_images(
-                    self._current_images, self._pose.path_positions,
-                    self._lidar_model, self._pose.path_width
-                )
-
-                self.model_ipm_plane = self._basefootprint_model @ scale(self.meters_x, self.meters_y, 1.0)
-
-                bev, valid_mask, bev_drivable = self._ipm_module.warp_images(self._current_raw_images, self._current_images_mask)
-
-                self._ipm_plane.set_texture(bev, valid_mask)
-
-                if bev_drivable is not None:
-                    # poligon set
-                    self._hd_boundary_accumulator.update(bev_drivable, self.model_ipm_plane)
-                    # grid accumulation
-                    self._hd_grid_acc.update(
-                        bev_drivable,
-                        bev,                 # <-- pass colored BEV image
-                        self.model_ipm_plane
+                    # draw the path on the images
+                    self._path_images = self._label_camera_mgr.bake_path_on_images(
+                        self._current_images, self._pose.path_positions,
+                        self._lidar_model, self._pose.path_width
                     )
 
-                    if self._hd_grid_acc._polygons_edited:
-                        self._polys = self._hd_grid_acc.get_editable_polygons() or []
-                    else:
-                        self._polys = self._hd_grid_acc.extract_polygons()
-                        self._hd_grid_acc.update_polygon_spheres(self._polys)
+                    self.model_ipm_plane = self._basefootprint_model @ scale(self.meters_x, self.meters_y, 1.0)
 
-                    rgba = self._hd_grid_acc.to_rgba(alpha_scale=220)
-                    self._hd_grid_plane.set_texture_rgba(rgba)
+                    bev, valid_mask, bev_drivable = self._ipm_module.warp_images(self._current_raw_images, self._current_images_mask)
 
-                    center = np.array(self._pose.path_positions, dtype=np.float32)
-                    if center.ndim == 1:
-                        center = center.reshape(-1, 2)
-                    if center.shape[1] == 2:
-                        center = np.concatenate([center, np.zeros((len(center), 1), dtype=np.float32)], axis=1)
+                    self._ipm_plane.set_texture(bev, valid_mask)
 
-                    if self._polys:
-                        poly = self._polys[0]  # assuming single drivable region
-
-                        left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
-                            polygon_world=poly,
-                            centerline_world=np.asarray(self._pose.path_positions, dtype=np.float32)
+                    if bev_drivable is not None:
+                        # poligon set
+                        self._hd_boundary_accumulator.update(bev_drivable, self.model_ipm_plane)
+                        # grid accumulation
+                        self._hd_grid_acc.update(
+                            bev_drivable,
+                            bev,                 # <-- pass colored BEV image
+                            self.model_ipm_plane
                         )
 
-                    self._path_center = center
-                    self._path_left = left
-                    self._path_right = right
+                        if self._hd_grid_acc._polygons_edited:
+                            self._polys = self._hd_grid_acc.get_editable_polygons() or []
+                        else:
+                            self._polys = self._hd_grid_acc.extract_polygons()
+                            self._hd_grid_acc.update_polygon_spheres(self._polys)
 
-                # person detection
-                self._person_detection_module.get_camera_images(self._current_images)
+                        rgba = self._hd_grid_acc.to_rgba(alpha_scale=220)
+                        self._hd_grid_plane.set_texture_rgba(rgba)
 
-            # only if true, color the pointcloud with the rgb images (undistorted)
-            if self._ui.show_colored_points:
-                self._camera_lidar_module.poll_colored_pointcloud(self._colored_pointcloud)
+                        center = np.array(self._pose.path_positions, dtype=np.float32)
+                        if center.ndim == 1:
+                            center = center.reshape(-1, 2)
+                        if center.shape[1] == 2:
+                            center = np.concatenate([center, np.zeros((len(center), 1), dtype=np.float32)], axis=1)
 
-            # draw the labels on the images
-            if self._labels_dirty and self._path_images:
-                self._labels_dirty = False
-                annotated = self._label_camera_mgr.draw_labels_on_camera(
-                    self._path_images, self._labels.labels()
-                )
-                for i, (_cam_name, tex) in enumerate(self._ui._textures):
-                    if i < len(annotated) and annotated[i] is not None:
-                        tex.update(annotated[i])
+                        if self._polys:
+                            poly = self._polys[0]  # assuming single drivable region
 
-            # Draw UI
-            self._ui.draw()
+                            left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
+                                polygon_world=poly,
+                                centerline_world=np.asarray(self._pose.path_positions, dtype=np.float32)
+                            )
 
-            # Setup viewport + camera
-            width, height = glfw.get_framebuffer_size(self._window)
-            glViewport(0, 0, width, height)
+                        self._path_center = center
+                        self._path_left = left
+                        self._path_right = right
 
-            glUniformMatrix4fv(proj_loc, 1, GL_FALSE, proj.T)
-            glUniformMatrix4fv(view_loc, 1, GL_FALSE, view.T)
+                    # person detection
+                    self._person_detection_module.get_camera_images(self._current_images)
 
-            # Clear
-            glClearColor(0.05, 0.05, 0.05, 1.0)
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+                # only if true, color the pointcloud with the rgb images (undistorted)
+                if self._ui.show_colored_points:
+                    self._camera_lidar_module.poll_colored_pointcloud(self._colored_pointcloud)
 
-            identity = np.identity(4, dtype=np.float32)
+                # draw the labels on the images
+                if self._labels_dirty and self._path_images:
+                    self._labels_dirty = False
+                    annotated = self._label_camera_mgr.draw_labels_on_camera(
+                        self._path_images, self._labels.labels()
+                    )
+                    for i, (_cam_name, tex) in enumerate(self._ui._textures):
+                        if i < len(annotated) and annotated[i] is not None:
+                            tex.update(annotated[i])
 
-            # Grid
-            if self._ui.show_grid:
-                grid_model = translate(0, 0, -0.001)
-                self._set_model_color(grid_model, 0.25, 0.25, 0.25, 1.0)
-                self._grid.draw()
+                # Draw UI
+                self._ui.draw()
 
-            # draw the IPM plane based on the base footprint frame
-            if self._ui.show_ipm and self._ipm_plane.has_texture:
+                # Setup viewport + camera
+                width, height = glfw.get_framebuffer_size(self._window)
+                glViewport(0, 0, width, height)
 
-                self._ipm_plane.draw(view.T, proj.T, self.model_ipm_plane.T)
-                if self._hd_boundary_accumulator.get_polygons() is not None:
-                    glUseProgram(self._program)
-                    self._set_model_color(identity, 1.0, 1.0, 1.0, 1.0)  # white; change r,g,b to change color
-                    glLineWidth(4.0)
-                    for poly in self._hd_boundary_accumulator.get_polygons():
-                        glBegin(GL_LINE_LOOP)
-                        for p in poly:
-                            glVertex3f(p[0], p[1], p[2] + 0.2)  # small lift above plane
-                        glEnd()
-                    glLineWidth(1.0)
+                glUniformMatrix4fv(proj_loc, 1, GL_FALSE, proj.T)
+                glUniformMatrix4fv(view_loc, 1, GL_FALSE, view.T)
 
-            if self._ui.show_ipm and self._hd_grid_plane.has_texture:
+                # Clear
+                glClearColor(0.05, 0.05, 0.05, 1.0)
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-                grid_model = translate(
-                    self._hd_grid_acc.origin_x + self._hd_grid_acc.size_x / 2.0,
-                    self._hd_grid_acc.origin_y + self._hd_grid_acc.size_y / 2.0,
-                    0.01
-                ) @ scale(
-                    self._hd_grid_acc.size_x,
-                    self._hd_grid_acc.size_y,
-                    1.0
-                )
+                identity = np.identity(4, dtype=np.float32)
 
-                self._hd_grid_plane.draw(view.T, proj.T, grid_model.T)
+                # Grid
+                if self._ui.show_grid:
+                    grid_model = translate(0, 0, -0.001)
+                    self._set_model_color(grid_model, 0.25, 0.25, 0.25, 1.0)
+                    self._grid.draw()
 
-                if self._polys:
-                    glUseProgram(self._program)
-                    self._set_model_color(identity, 0.0, 1.0, 0.0, 1.0)
-                    glLineWidth(4.0)
+                # draw the IPM plane based on the base footprint frame
+                if self._ui.show_ipm and self._ipm_plane.has_texture:
 
-                    for poly in self._polys:
-                        glBegin(GL_LINE_LOOP)
-                        for p in poly:
-                            glVertex3f(p[0], p[1], p[2] + 0.05)
-                        glEnd()
+                    self._ipm_plane.draw(view.T, proj.T, self.model_ipm_plane.T)
+                    if self._hd_boundary_accumulator.get_polygons() is not None:
+                        glUseProgram(self._program)
+                        self._set_model_color(identity, 1.0, 1.0, 1.0, 1.0)  # white; change r,g,b to change color
+                        glLineWidth(4.0)
+                        for poly in self._hd_boundary_accumulator.get_polygons():
+                            glBegin(GL_LINE_LOOP)
+                            for p in poly:
+                                glVertex3f(p[0], p[1], p[2] + 0.2)  # small lift above plane
+                            glEnd()
+                        glLineWidth(1.0)
 
-                    glLineWidth(1.0)
+                if self._ui.show_ipm and self._hd_grid_plane.has_texture:
 
-                    self._hd_grid_acc.draw_polygon_spheres(view.T, proj.T)
+                    grid_model = translate(
+                        self._hd_grid_acc.origin_x + self._hd_grid_acc.size_x / 2.0,
+                        self._hd_grid_acc.origin_y + self._hd_grid_acc.size_y / 2.0,
+                        0.01
+                    ) @ scale(
+                        self._hd_grid_acc.size_x,
+                        self._hd_grid_acc.size_y,
+                        1.0
+                    )
+
+                    self._hd_grid_plane.draw(view.T, proj.T, grid_model.T)
+
+                    if self._polys:
+                        glUseProgram(self._program)
+                        self._set_model_color(identity, 0.0, 1.0, 0.0, 1.0)
+                        glLineWidth(4.0)
+
+                        for poly in self._polys:
+                            glBegin(GL_LINE_LOOP)
+                            for p in poly:
+                                glVertex3f(p[0], p[1], p[2] + 0.05)
+                            glEnd()
+
+                        glLineWidth(1.0)
+
+                        self._hd_grid_acc.draw_polygon_spheres(view.T, proj.T)
 
 
-                if self._path_center is not None and len(self._path_center) >= 2:
-                    z_lift = 0.05
-                    glUseProgram(self._program)
-                    glLineWidth(3.0)
-                    center, left, right = self._path_center, self._path_left, self._path_right
-                    # centerline: yellow
-                    self._set_model_color(identity, 1.0, 1.0, 0.0, 1.0)
-                    glBegin(GL_LINE_STRIP)
-                    for p in center:
-                        glVertex3f(p[0], p[1], p[2] + z_lift)
-                    glEnd()
-                    if left is not None:
-                        self._set_model_color(identity, 0.0, 1.0, 1.0, 1.0)
+                    if self._path_center is not None and len(self._path_center) >= 2:
+                        z_lift = 0.05
+                        glUseProgram(self._program)
+                        glLineWidth(3.0)
+                        center, left, right = self._path_center, self._path_left, self._path_right
+                        # centerline: yellow
+                        self._set_model_color(identity, 1.0, 1.0, 0.0, 1.0)
                         glBegin(GL_LINE_STRIP)
-                        for p in left:
+                        for p in center:
                             glVertex3f(p[0], p[1], p[2] + z_lift)
                         glEnd()
-                    if right is not None:
-                        self._set_model_color(identity, 1.0, 0.0, 1.0, 1.0)
-                        glBegin(GL_LINE_STRIP)
-                        for p in right:
-                            glVertex3f(p[0], p[1], p[2] + z_lift)
-                        glEnd()
-                    glLineWidth(1.0)
+                        if left is not None:
+                            self._set_model_color(identity, 0.0, 1.0, 1.0, 1.0)
+                            glBegin(GL_LINE_STRIP)
+                            for p in left:
+                                glVertex3f(p[0], p[1], p[2] + z_lift)
+                            glEnd()
+                        if right is not None:
+                            self._set_model_color(identity, 1.0, 0.0, 1.0, 1.0)
+                            glBegin(GL_LINE_STRIP)
+                            for p in right:
+                                glVertex3f(p[0], p[1], p[2] + z_lift)
+                            glEnd()
+                        glLineWidth(1.0)
 
-            # Point Cloud: transformed to world space via ego-pose; labels stay at lidar origin
-            glUseProgram(self._program_points)
-            glUniformMatrix4fv(self._proj_loc_points, 1, GL_FALSE, proj.T)
-            glUniformMatrix4fv(self._view_loc_points, 1, GL_FALSE, view.T)
-            glUniformMatrix4fv(self._model_loc_points, 1, GL_FALSE, self._lidar_model.T)
-            self._pointcloud.draw()
-            glUseProgram(self._program)
+                # Point Cloud: transformed to world space via ego-pose; labels stay at lidar origin
+                glUseProgram(self._program_points)
+                glUniformMatrix4fv(self._proj_loc_points, 1, GL_FALSE, proj.T)
+                glUniformMatrix4fv(self._view_loc_points, 1, GL_FALSE, view.T)
+                glUniformMatrix4fv(self._model_loc_points, 1, GL_FALSE, self._lidar_model.T)
+                self._pointcloud.draw()
+                glUseProgram(self._program)
 
-            # Axes
-            if self._ui.show_axes:
-                draw_axes(self._cube, self._set_model_color, identity)
+                # Axes
+                if self._ui.show_axes:
+                    draw_axes(self._cube, self._set_model_color, identity)
 
-            # draw camera axes based on the lidar frame
-            self._camera_lidar_module.draw_cameras_lidar_frame_axes(self._cube, self._lidar_model, view.T, proj.T, self._set_model_color)
+                # draw camera axes based on the lidar frame
+                self._camera_lidar_module.draw_cameras_lidar_frame_axes(self._cube, self._lidar_model, view.T, proj.T, self._set_model_color)
 
-            # draw car axes based on the lidar frame
-            self._car_model.draw_axes(self._cube, self._lidar_model, self._set_model_color, identity)
+                # draw car axes based on the lidar frame
+                self._car_model.draw_axes(self._cube, self._lidar_model, self._set_model_color, identity)
 
-            # draw camera-colored LiDAR point cloud (uploaded once per scene on reload)
-            glUseProgram(self._program_points)
-            glUniformMatrix4fv(self._proj_loc_points, 1, GL_FALSE, proj.T)
-            glUniformMatrix4fv(self._view_loc_points, 1, GL_FALSE, view.T)
-            glUniformMatrix4fv(self._model_loc_points, 1, GL_FALSE, self._lidar_model.T)
-            if self._ui.show_colored_points:
-                self._colored_pointcloud.draw()
-            glUseProgram(self._program)
+                # draw camera-colored LiDAR point cloud (uploaded once per scene on reload)
+                glUseProgram(self._program_points)
+                glUniformMatrix4fv(self._proj_loc_points, 1, GL_FALSE, proj.T)
+                glUniformMatrix4fv(self._view_loc_points, 1, GL_FALSE, view.T)
+                glUniformMatrix4fv(self._model_loc_points, 1, GL_FALSE, self._lidar_model.T)
+                if self._ui.show_colored_points:
+                    self._colored_pointcloud.draw()
+                glUseProgram(self._program)
 
-            # Labels: stored in lidar frame, rendered in world space via lidar_model
-            self._labels.draw(self._cube, self._set_model_color, view.T, proj.T, self._lidar_model)
-            glUseProgram(self._program)
+                # Labels: stored in lidar frame, rendered in world space via lidar_model
+                self._labels.draw(self._cube, self._set_model_color, view.T, proj.T, self._lidar_model)
+                glUseProgram(self._program)
 
-            # Ego pose
-            self._pose.draw(view.T, proj.T, show_pose=self._ui.show_pose)
-            glUseProgram(self._program)
+                # Ego pose
+                self._pose.draw(view.T, proj.T, show_pose=self._ui.show_pose)
+                glUseProgram(self._program)
 
-            if self._ui.consume_add_request():
-                self._labels.add_label(
-                    center=[0, 0, 1],
-                    size=[2, 1, 1.5],
-                    yaw=0.0,
-                    label_type=self._ui.selected_label_type()
-                )
-                self._labels_dirty = True
+                if self._ui.consume_add_request():
+                    self._labels.add_label(
+                        center=[0, 0, 1],
+                        size=[2, 1, 1.5],
+                        yaw=0.0,
+                        label_type=self._ui.selected_label_type()
+                    )
+                    self._labels_dirty = True
 
-            if self._ui.consume_remove_request():
-                self._labels.remove_last()
-                self._labels_dirty = True
+                if self._ui.consume_remove_request():
+                    self._labels.remove_last()
+                    self._labels_dirty = True
 
-            if self._ui.consume_delete_selected_request():
-                self._labels.remove_selected()
-                self._labels_dirty = True
+                if self._ui.consume_delete_selected_request():
+                    self._labels.remove_selected()
+                    self._labels_dirty = True
+
+            else:
+                # Draw UI
+                self._ui.draw()
+
+                # Setup viewport + camera
+                width, height = glfw.get_framebuffer_size(self._window)
+                glViewport(0, 0, width, height)
+
+                glUniformMatrix4fv(proj_loc, 1, GL_FALSE, proj.T)
+                glUniformMatrix4fv(view_loc, 1, GL_FALSE, view.T)
+
+                # Clear
+                glClearColor(0.05, 0.05, 0.05, 1.0)
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+                identity = np.identity(4, dtype=np.float32)
+
+                # Grid
+                if self._ui.show_grid:
+                    grid_model = translate(0, 0, -0.001)
+                    self._set_model_color(grid_model, 0.25, 0.25, 0.25, 1.0)
+                    self._grid.draw()
+
+                
 
             # Render ImGui ON TOP
             imgui.render()
