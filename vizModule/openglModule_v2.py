@@ -427,6 +427,8 @@ class SceneUI:
         self.show_colored_points = False
         self.show_pose = False
         self.show_ipm = False
+        self.show_edit_polygon = False  # mapping complete: extract polygon + show spheres for editing
+        self._needs_polygon_extract = False  # one-shot: extract when user checks show_edit_polygon
 
         self._needs_reload = True
         self._textures = []   # store loaded GL textures
@@ -442,6 +444,10 @@ class SceneUI:
         self._remove_box_request = False
         self._delete_selected_request = False
         self._live_topic_mode = False  # when True: no selection, minimal UI; toggle with button
+
+        self._add_polygon_point_request = False
+        self._erase_polygon_point_request = False
+        self._polygon_mode = None   # None | "add" | "erase"
 
     def load_images_for_scene(self, idx):
         self._textures.clear()
@@ -504,6 +510,10 @@ class SceneUI:
         if changed:
             self._needs_reload = True
 
+        changed, self.show_edit_polygon = imgui.checkbox("Mapping complete - Edit polygon", self.show_edit_polygon)
+        if changed and self.show_edit_polygon:
+            self._needs_polygon_extract = True
+
         # Label Controls
         imgui.text("3D Labels")
 
@@ -557,6 +567,17 @@ class SceneUI:
         if imgui.button("Save KITTI"):
             self.label_manager.save_kitti()
 
+        imgui.separator()
+        imgui.text("Polygon Edit")
+
+        if imgui.button("Add Vertex"):
+            self._polygon_mode = "add"
+
+        imgui.same_line()
+
+        if imgui.button("Erase Vertex"):
+            self._polygon_mode = "erase"
+
         imgui.end()
 
         # Images panel
@@ -573,6 +594,10 @@ class SceneUI:
             imgui.separator()
 
         imgui.end()
+
+    def consume_polygon_mode(self):
+        mode = self._polygon_mode
+        return mode
 
     def consume_reload_flag(self):
         """Returns True if a new scene must be loaded."""
@@ -804,7 +829,7 @@ class Viz:
                         inv_proj, inv_view, cam_pos_world
                     )
 
-                    if not self._ui._live_topic_mode:
+                    if not self._ui._live_topic_mode and self._ui.show_edit_polygon:
 
                         polygon_result = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos, ray_dir)
                         if polygon_result is not None:
@@ -832,45 +857,88 @@ class Viz:
 
                         if not self._ui._live_topic_mode:
 
-                            # bring ray into lidar frame so label.intersect_ray works correctly
-                            inv_lidar = np.linalg.inv(self._lidar_model)
-                            cam_pos_l = (inv_lidar @ np.append(cam_pos, 1.0))[:3]
-                            ray_dir_l = (inv_lidar @ np.append(ray_dir, 0.0))[:3]
-                            n = np.linalg.norm(ray_dir_l)
-                            if n > 1e-8:
-                                ray_dir_l /= n
+                            handled_polygon_mode = False
+                            if self._ui.show_edit_polygon:
+                                polygon_mode = self._ui.consume_polygon_mode()
 
-                            closest_label = None
-                            min_label_t = float("inf")
+                                if polygon_mode is not None:
 
-                            for i, label in enumerate(self._labels.labels()):
-                                t = label.intersect_ray(cam_pos_l, ray_dir_l)
-                                if t is not None and t < min_label_t:
-                                    min_label_t = t
-                                    closest_label = i
+                                    if polygon_mode == "add":
+                                        if abs(ray_dir[2]) > 1e-6:
+                                            t = -cam_pos[2] / ray_dir[2]
+                                            hit = cam_pos + t * ray_dir
+                                        else:
+                                            hit = None
 
-                            # pose sphere pick (world ray)
-                            sphere_result = self._pose._marker_renderer.intersect_ray(cam_pos, ray_dir)
-                            if sphere_result is not None:
-                                sphere_idx, sphere_t = sphere_result
-                            else:
-                                sphere_idx, sphere_t = None, float("inf")
+                                        if hit is not None:
+                                            self._hd_grid_acc.add_vertex_to_selected_polygon(hit)
 
-                            # polygon sphere pick (world ray)
-                            polygon_result = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos, ray_dir)
-                            if polygon_result is not None:
-                                polygon_idx, polygon_t = polygon_result
-                            else:
-                                polygon_idx, polygon_t = None, float("inf")
+                                    elif polygon_mode == "erase":
+                                        self._hd_grid_acc.erase_selected_vertex()
 
-                            # selection priority (same as your logic)
-                            if sphere_idx is not None and sphere_t < min_label_t and sphere_t < polygon_t:
-                                self._pose._marker_renderer.select(sphere_idx)
-                            elif polygon_idx is not None and polygon_t < min_label_t and polygon_t < sphere_t:
-                                self._hd_grid_acc._polygon_spheres.select(polygon_idx)
-                            elif closest_label is not None:
-                                self._labels.select(closest_label)
-                                self._labels_dirty = True
+                                    self._hd_grid_acc.rebuild_spheres_from_editable()
+                                    self._hd_grid_acc.rasterize_edited_polygons_to_grid()
+                                    # upload updated grid texture so the green fill reflects the new polygon
+                                    rgba = self._hd_grid_acc.to_rgba(alpha_scale=220)
+                                    self._hd_grid_plane.set_texture_rgba(rgba)
+                                    # refresh green polygon line and left/right path lines
+                                    self._polys = self._hd_grid_acc.get_editable_polygons() or []
+                                    if self._polys and self._pose.path_positions is not None and len(self._pose.path_positions) >= 2:
+                                        left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
+                                            polygon_world=self._polys[0],
+                                            centerline_world=np.asarray(self._pose.path_positions, dtype=np.float32)
+                                        )
+                                        self._path_left, self._path_right = left, right
+                                    else:
+                                        self._path_left, self._path_right = None, None
+
+                                    self._ui._polygon_mode = None
+                                    handled_polygon_mode = True
+
+                            if not handled_polygon_mode:
+
+                                # bring ray into lidar frame so label.intersect_ray works correctly
+                                inv_lidar = np.linalg.inv(self._lidar_model)
+                                cam_pos_l = (inv_lidar @ np.append(cam_pos, 1.0))[:3]
+                                ray_dir_l = (inv_lidar @ np.append(ray_dir, 0.0))[:3]
+                                n = np.linalg.norm(ray_dir_l)
+                                if n > 1e-8:
+                                    ray_dir_l /= n
+
+                                closest_label = None
+                                min_label_t = float("inf")
+
+                                for i, label in enumerate(self._labels.labels()):
+                                    t = label.intersect_ray(cam_pos_l, ray_dir_l)
+                                    if t is not None and t < min_label_t:
+                                        min_label_t = t
+                                        closest_label = i
+
+                                # pose sphere pick (world ray)
+                                sphere_result = self._pose._marker_renderer.intersect_ray(cam_pos, ray_dir)
+                                if sphere_result is not None:
+                                    sphere_idx, sphere_t = sphere_result
+                                else:
+                                    sphere_idx, sphere_t = None, float("inf")
+
+                                # polygon sphere pick (world ray) — only when edit-polygon mode
+                                if self._ui.show_edit_polygon:
+                                    polygon_result = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos, ray_dir)
+                                    if polygon_result is not None:
+                                        polygon_idx, polygon_t = polygon_result
+                                    else:
+                                        polygon_idx, polygon_t = None, float("inf")
+                                else:
+                                    polygon_idx, polygon_t = None, float("inf")
+
+                                # selection priority (same as your logic)
+                                if sphere_idx is not None and sphere_t < min_label_t and sphere_t < polygon_t:
+                                    self._pose._marker_renderer.select(sphere_idx)
+                                elif polygon_idx is not None and polygon_t < min_label_t and polygon_t < sphere_t:
+                                    self._hd_grid_acc._polygon_spheres.select(polygon_idx)
+                                elif closest_label is not None:
+                                    self._labels.select(closest_label)
+                                    self._labels_dirty = True
 
                     # Finish polygon drag (if any) + bake grid once on release (only when releasing)
                     if not self._ui._live_topic_mode:
@@ -879,12 +947,22 @@ class Viz:
 
                         self._hd_grid_acc._polygon_spheres.end_drag()
 
-                        if was_dragging and drag_idx >= 0:
+                        if self._ui.show_edit_polygon and was_dragging and drag_idx >= 0:
                             # ensure final position is committed
                             self._hd_grid_acc.sync_sphere_to_polygon(drag_idx)
                             self._hd_grid_acc.rasterize_edited_polygons_to_grid()
                             rgba = self._hd_grid_acc.to_rgba(alpha_scale=220)
                             self._hd_grid_plane.set_texture_rgba(rgba)
+                            # refresh green polygon line and left/right path lines from current editable polygon
+                            self._polys = self._hd_grid_acc.get_editable_polygons() or []
+                            if self._polys and self._pose.path_positions is not None and len(self._pose.path_positions) >= 2:
+                                left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
+                                    polygon_world=self._polys[0],
+                                    centerline_world=np.asarray(self._pose.path_positions, dtype=np.float32)
+                                )
+                                self._path_left, self._path_right = left, right
+                            else:
+                                self._path_left, self._path_right = None, None
 
                     self._mouse_pressed = False
 
@@ -892,7 +970,7 @@ class Viz:
                 # DRAG behavior (either sphere drag OR camera orbit/pan)
                 # -----------------------------
                 if left_pressed:
-                    if self._hd_grid_acc._polygon_spheres._dragging and not self._ui._live_topic_mode:
+                    if self._hd_grid_acc._polygon_spheres._dragging and not self._ui._live_topic_mode and self._ui.show_edit_polygon:
                         # Only compute ray while dragging a polygon sphere
                         inv_proj = np.linalg.inv(proj)
                         inv_view = np.linalg.inv(view)
@@ -907,6 +985,16 @@ class Viz:
                         idx = self._hd_grid_acc._polygon_spheres._selected_index
                         if idx >= 0:
                             self._hd_grid_acc.sync_sphere_to_polygon(idx)
+                            # update green line and left/right path lines during drag
+                            self._polys = self._hd_grid_acc.get_editable_polygons() or []
+                            if self._polys and self._pose.path_positions is not None and len(self._pose.path_positions) >= 2:
+                                left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
+                                    polygon_world=self._polys[0],
+                                    centerline_world=np.asarray(self._pose.path_positions, dtype=np.float32)
+                                )
+                                self._path_left, self._path_right = left, right
+                            else:
+                                self._path_left, self._path_right = None, None
 
                     else:
                         # Pure camera movement (NO ray math)
@@ -938,8 +1026,8 @@ class Viz:
 
                 if not self._ui._live_topic_mode:
 
-                    # ESC: release polygon edit (deselect sphere, end drag, allow HD map to update again)
-                    if glfw.get_key(self._window, glfw.KEY_ESCAPE) == glfw.PRESS:
+                    # ESC: release polygon edit (deselect sphere, end drag) — only when edit-polygon mode
+                    if self._ui.show_edit_polygon and glfw.get_key(self._window, glfw.KEY_ESCAPE) == glfw.PRESS:
                         self._hd_grid_acc._polygon_spheres.end_drag()
                         self._hd_grid_acc._polygon_spheres.select(-1)
                         self._hd_grid_acc.clear_polygon_edits()
@@ -1026,18 +1114,12 @@ class Viz:
                     if bev_drivable is not None:
                         # poligon set
                         self._hd_boundary_accumulator.update(bev_drivable, self.model_ipm_plane)
-                        # grid accumulation
+                        # grid accumulation (always; polygon extraction only when checkbox on)
                         self._hd_grid_acc.update(
                             bev_drivable,
                             bev,                 # <-- pass colored BEV image
                             self.model_ipm_plane
                         )
-
-                        if self._hd_grid_acc._polygons_edited:
-                            self._polys = self._hd_grid_acc.get_editable_polygons() or []
-                        else:
-                            self._polys = self._hd_grid_acc.extract_polygons()
-                            self._hd_grid_acc.update_polygon_spheres(self._polys)
 
                         rgba = self._hd_grid_acc.to_rgba(alpha_scale=220)
                         self._hd_grid_plane.set_texture_rgba(rgba)
@@ -1048,20 +1130,55 @@ class Viz:
                         if center.shape[1] == 2:
                             center = np.concatenate([center, np.zeros((len(center), 1), dtype=np.float32)], axis=1)
 
-                        if self._polys:
-                            poly = self._polys[0]  # assuming single drivable region
-
-                            left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
-                                polygon_world=poly,
-                                centerline_world=np.asarray(self._pose.path_positions, dtype=np.float32)
-                            )
-
-                        self._path_center = center
-                        self._path_left = left
-                        self._path_right = right
+                        if self._ui.show_edit_polygon:
+                            if self._hd_grid_acc._polygons_edited:
+                                self._polys = self._hd_grid_acc.get_editable_polygons() or []
+                            else:
+                                self._polys = self._hd_grid_acc.extract_polygons()
+                                self._hd_grid_acc.update_polygon_spheres(self._polys)
+                            left, right = None, None
+                            if self._polys:
+                                poly = self._polys[0]  # assuming single drivable region
+                                left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
+                                    polygon_world=poly,
+                                    centerline_world=np.asarray(self._pose.path_positions, dtype=np.float32)
+                                )
+                            self._path_center = center
+                            self._path_left = left
+                            self._path_right = right
+                        else:
+                            self._polys = []
+                            self._path_center = center
+                            self._path_left = None
+                            self._path_right = None
 
                     # person detection
                     self._person_detection_module.get_camera_images(self._current_images)
+
+                # When user checks "Edit polygon" without reloading: extract once from current grid
+                if self._ui._needs_polygon_extract and self._ui.show_edit_polygon and self._hd_grid_plane.has_texture:
+                    self._ui._needs_polygon_extract = False
+                    if self._hd_grid_acc._polygons_edited:
+                        self._polys = self._hd_grid_acc.get_editable_polygons() or []
+                    else:
+                        self._polys = self._hd_grid_acc.extract_polygons()
+                        self._hd_grid_acc.update_polygon_spheres(self._polys)
+                    left, right = None, None
+                    if self._polys and self._pose.path_positions is not None and len(self._pose.path_positions) >= 2:
+                        center = np.array(self._pose.path_positions, dtype=np.float32)
+                        if center.ndim == 1:
+                            center = center.reshape(-1, 2)
+                        if center.shape[1] == 2:
+                            center = np.concatenate([center, np.zeros((len(center), 1), dtype=np.float32)], axis=1)
+                        self._path_center = center
+                        left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
+                            polygon_world=self._polys[0],
+                            centerline_world=np.asarray(self._pose.path_positions, dtype=np.float32)
+                        )
+                        self._path_left, self._path_right = left, right
+                    else:
+                        self._path_left = None
+                        self._path_right = None
 
                 # only if true, color the pointcloud with the rgb images (undistorted)
                 if self._ui.show_colored_points:

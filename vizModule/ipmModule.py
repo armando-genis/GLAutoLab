@@ -676,6 +676,10 @@ class HDMapGridAccumulator:
 
         np.add.at(self.conf, (gy, gx), 1.0)
 
+        # after erase the mask never "blocks" on an old polygon.
+        self._edit_snapshot_conf = self.conf.copy()
+        self._edit_snapshot_color = self.color.copy()
+
     # --------------------------------------------------
     # Convert to RGBA texture
     # --------------------------------------------------
@@ -932,9 +936,7 @@ class HDMapGridAccumulator:
     def clear_polygon_edits(self):
         """Clear edited state so next update_polygon_spheres will overwrite from grid again."""
         self._polygons_edited = False
-        if hasattr(self, "_edit_snapshot_conf"):
-            self._edit_snapshot_conf = None
-            self._edit_snapshot_color = None
+        # Keep _edit_snapshot_* so rasterize always restores the BEV base (set in update()), never a dirty grid
 
     def draw_polygon_spheres(self, view: np.ndarray, projection: np.ndarray):
         self._polygon_spheres.draw(view, projection)
@@ -1097,3 +1099,76 @@ class HDMapGridAccumulator:
             np.asarray(left_pts, dtype=np.float32),
             np.asarray(right_pts, dtype=np.float32),
         )
+
+    def add_vertex_to_selected_polygon(self, world_point):
+        """
+        Adds vertex to currently selected polygon.
+        Inserts between nearest edge.
+        """
+
+        if not self._polygons_editable:
+            return
+
+        poly = self._polygons_editable[0]  # assuming single region
+
+        p = np.array(world_point[:3], dtype=np.float32)
+        p[2] = 0.0
+
+        # Find nearest edge
+        min_dist = float("inf")
+        insert_idx = 0
+
+        for i in range(len(poly)):
+            p0 = poly[i]
+            p1 = poly[(i+1) % len(poly)]
+
+            # distance from point to segment
+            v = p1 - p0
+            w = p - p0
+
+            c1 = np.dot(w, v)
+            if c1 <= 0:
+                dist = np.linalg.norm(p - p0)
+            else:
+                c2 = np.dot(v, v)
+                if c2 <= c1:
+                    dist = np.linalg.norm(p - p1)
+                else:
+                    b = c1 / c2
+                    pb = p0 + b * v
+                    dist = np.linalg.norm(p - pb)
+
+            if dist < min_dist:
+                min_dist = dist
+                insert_idx = i + 1
+
+        self._polygons_editable[0] = np.insert(poly, insert_idx, p, axis=0)
+        self._polygons_edited = True
+
+    def erase_selected_vertex(self):
+        idx = self._polygon_spheres._selected_index
+        if idx < 0:
+            return
+
+        poly_idx, point_idx = self._sphere_to_poly[idx]
+
+        poly = self._polygons_editable[poly_idx]
+        if len(poly) <= 3:
+            return  # cannot delete triangle
+
+        # Commit all current sphere positions to the polygon so remaining vertices keep their places
+        self.sync_all_spheres_to_polygons()
+
+        self._polygons_editable[poly_idx] = np.delete(poly, point_idx, axis=0)
+        self._polygons_edited = True
+
+    def rebuild_spheres_from_editable(self):
+        all_pts = []
+        self._sphere_to_poly = []
+
+        for pi, poly in enumerate(self._polygons_editable):
+            for pj, p in enumerate(poly):
+                all_pts.append(p)
+                self._sphere_to_poly.append((pi, pj))
+
+        self._polygon_spheres.build_from_positions_direct(all_pts)
