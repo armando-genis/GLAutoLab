@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional, List
 from CameraModule import IpmCameraConfig
-from PathRendererModule import PathSphereMarkerRenderer
+from PathRendererModule import PathSphereMarkerRenderer, PosePathRenderer
 from typing import List, Tuple, Optional
 
 
@@ -598,6 +598,25 @@ class HDMapGridAccumulator:
         self._centerline_pts: Optional[np.ndarray] = None
         self._centerline_edited = False
 
+        # Crosswalk spheres (white, draggable endpoint pairs)
+        self._crosswalk_spheres = PathSphereMarkerRenderer(radius=0.20, color=(1.0, 1.0, 1.0, 0.9), drag_enabled=True)
+        self._crosswalk_pts: list = []               # list of (2,3) float32 arrays, one per crosswalk
+        self._crosswalk_pending: Optional[np.ndarray] = None  # first pt while awaiting second
+        self._crosswalk_width: float = 3.0
+
+        # Bike-lane spheres (orange, independent of polygon / centerline)
+        self._bike_lane_spheres = PathSphereMarkerRenderer(radius=0.15, color=(1.0, 0.55, 0.0, 0.9), drag_enabled=True)
+        self._bike_lane_pts: Optional[np.ndarray] = None   # active segment control pts
+        self._bike_lane_segments: list = []                # list of stored np.ndarray (Nx3)
+        self._bike_lane_edited = False
+        self._bike_lane_width: float = 1.5
+
+        # Ribbon renderers (PosePathRenderer) shown in the HD-map view
+        self._cl_ribbon = PosePathRenderer(width=1.0)       # purple centerline ribbon
+        self._cl_ribbon_width: float = 1.0
+        self._bl_ribbon_active = PosePathRenderer(width=self._bike_lane_width)  # green active BL
+        self._bl_ribbons: list = []                          # one PosePathRenderer per stored BL segment
+
         # Editable polygon representation: list of (N,3) arrays (2m-sampled points per polygon)
         self._polygons_editable: list[np.ndarray] = []
         # For each sphere index: (poly_idx, point_idx within that polygon's sampled points)
@@ -605,6 +624,11 @@ class HDMapGridAccumulator:
         self._polygons_edited = False
 
         self._last_polygon_hash = None
+
+        # Snapshots of the clean BEV grid used for polygon rasterisation.
+        # Initialised here so loading data before any update() call is safe.
+        self._edit_snapshot_conf = None
+        self._edit_snapshot_color = None
 
     # --------------------------------------------------
     # Reset map
@@ -1381,3 +1405,268 @@ class HDMapGridAccumulator:
         if self._centerline_pts is None:
             return
         self._centerline_spheres.build_from_positions_direct(list(self._centerline_pts))
+
+    # --------------------------------------------------
+    # Bike-lane vertex add / erase / sync / draw
+    # --------------------------------------------------
+
+    def init_bike_lane(self, positions: np.ndarray):
+        """
+        Initialise (or reset) the bike lane from a set of world positions,
+        resampled at 1 m intervals.  Pass an empty array / None to clear.
+        """
+        if positions is None or len(positions) == 0:
+            self._bike_lane_pts = None
+            self._bike_lane_edited = False
+            self._bike_lane_spheres.build_from_positions_direct([])
+            return
+        sampled = self.sample_polyline_every(positions, step_m=1.0)
+        self._bike_lane_pts = np.asarray(sampled, dtype=np.float32)
+        self._bike_lane_pts[:, 2] = 0.0
+        self._bike_lane_edited = False
+        self._bike_lane_spheres.build_from_positions_direct(list(self._bike_lane_pts))
+
+    def sync_bike_lane_sphere(self, sphere_index: int):
+        """Commit a moved bike-lane sphere into _bike_lane_pts (no neighbour smoothing)."""
+        if self._bike_lane_pts is None:
+            return
+        if sphere_index < 0 or sphere_index >= len(self._bike_lane_pts):
+            return
+        pos = self._bike_lane_spheres._centers[sphere_index].copy()
+        pos[2] = 0.0
+        self._bike_lane_pts[sphere_index] = pos
+        self._bike_lane_edited = True
+
+    def get_smooth_bike_lane(self, samples_per_seg: int = 5) -> Optional[np.ndarray]:
+        """Open Catmull-Rom spline through the bike-lane control points."""
+        if self._bike_lane_pts is None or len(self._bike_lane_pts) < 2:
+            return self._bike_lane_pts
+        return self._interpolate_open_curve(self._bike_lane_pts, samples_per_seg=samples_per_seg)
+
+    def add_vertex_to_bike_lane(self, world_point):
+        """
+        Insert a new bike-lane control point at the nearest edge of the
+        existing polyline.  If the lane is empty the point is just appended.
+        """
+        p = np.array(world_point[:3], dtype=np.float32)
+        p[2] = 0.0
+
+        if self._bike_lane_pts is None or len(self._bike_lane_pts) == 0:
+            self._bike_lane_pts = p.reshape(1, 3)
+            self._bike_lane_edited = True
+            return
+        if len(self._bike_lane_pts) == 1:
+            self._bike_lane_pts = np.vstack([self._bike_lane_pts, p])
+            self._bike_lane_edited = True
+            return
+
+        pts = self._bike_lane_pts
+        min_dist = float("inf")
+        insert_idx = len(pts)
+
+        for i in range(len(pts) - 1):
+            p0, p1 = pts[i], pts[i + 1]
+            v = p1 - p0
+            w = p - p0
+            c1 = float(np.dot(w, v))
+            c2 = float(np.dot(v, v))
+            if c1 <= 0:
+                dist = float(np.linalg.norm(p - p0))
+            elif c2 <= c1:
+                dist = float(np.linalg.norm(p - p1))
+            else:
+                dist = float(np.linalg.norm(p - (p0 + (c1 / c2) * v)))
+            if dist < min_dist:
+                min_dist = dist
+                insert_idx = i + 1
+
+        self._bike_lane_pts = np.insert(pts, insert_idx, p, axis=0)
+        self._bike_lane_edited = True
+
+    def erase_selected_bike_lane_vertex(self):
+        """Remove the currently selected bike-lane sphere's control point."""
+        idx = self._bike_lane_spheres._selected_index
+        if idx < 0:
+            return
+        if self._bike_lane_pts is None or len(self._bike_lane_pts) <= 1:
+            self._bike_lane_pts = None
+            self._bike_lane_edited = True
+            return
+        self._bike_lane_pts = np.delete(self._bike_lane_pts, idx, axis=0)
+        self._bike_lane_edited = True
+
+    def rebuild_bike_lane_spheres(self):
+        """Rebuild sphere renderer from current _bike_lane_pts after add/erase."""
+        if self._bike_lane_pts is None or len(self._bike_lane_pts) == 0:
+            self._bike_lane_spheres.build_from_positions_direct([])
+            return
+        self._bike_lane_spheres.build_from_positions_direct(list(self._bike_lane_pts))
+
+    def store_bike_lane_segment(self):
+        """
+        Commit the active segment (_bike_lane_pts) to the stored list and
+        reset the active segment so a new one can be drawn.
+        Does nothing if the active segment has fewer than 2 points.
+        """
+        if self._bike_lane_pts is None or len(self._bike_lane_pts) < 2:
+            return
+        self._bike_lane_segments.append(self._bike_lane_pts.copy())
+        # Save current GL state before creating the renderer (its __init__
+        # calls glUseProgram which would corrupt the active shader for the
+        # caller's render loop).
+        prev_prog = glGetIntegerv(GL_CURRENT_PROGRAM)
+        prev_vao  = glGetIntegerv(GL_VERTEX_ARRAY_BINDING)
+        smooth = self._interpolate_open_curve(self._bike_lane_pts)
+        ribbon = PosePathRenderer(width=self._bike_lane_width)
+        ribbon.update_from_positions(list(smooth))
+        self._bl_ribbons.append(ribbon)
+        # Restore GL state
+        glUseProgram(int(prev_prog))
+        glBindVertexArray(int(prev_vao))
+        # Reset active segment and its ribbon
+        self._bike_lane_pts = None
+        self._bike_lane_edited = False
+        self._bike_lane_spheres.build_from_positions_direct([])
+        self._bl_ribbon_active._vertex_count = 0
+
+    def clear_all_bike_lane_segments(self):
+        """Remove all stored segments and their ribbon renderers."""
+        self._bike_lane_segments.clear()
+        self._bl_ribbons.clear()
+
+    # --------------------------------------------------
+    # Ribbon update helpers
+    # --------------------------------------------------
+
+    def update_cl_ribbon(self, smooth_pts: Optional[np.ndarray]):
+        """Upload the centerline smooth curve to the purple ribbon renderer."""
+        self._cl_ribbon.width = self._cl_ribbon_width
+        if smooth_pts is not None and len(smooth_pts) >= 2:
+            self._cl_ribbon.update_from_positions(list(smooth_pts))
+        else:
+            self._cl_ribbon._vertex_count = 0
+
+    def update_bl_active_ribbon(self, smooth_pts: Optional[np.ndarray]):
+        """Upload the active bike-lane smooth curve to the green ribbon renderer."""
+        self._bl_ribbon_active.width = self._bike_lane_width
+        if smooth_pts is not None and len(smooth_pts) >= 2:
+            self._bl_ribbon_active.update_from_positions(list(smooth_pts))
+        else:
+            self._bl_ribbon_active._vertex_count = 0
+
+    def rebuild_bike_lane_ribbons(self):
+        """Recreate all stored-segment ribbon renderers (e.g. after load)."""
+        # Save GL state — PosePathRenderer.__init__ calls glUseProgram internally.
+        prev_prog = glGetIntegerv(GL_CURRENT_PROGRAM)
+        prev_vao  = glGetIntegerv(GL_VERTEX_ARRAY_BINDING)
+        self._bl_ribbons = []
+        for seg_pts in self._bike_lane_segments:
+            if len(seg_pts) < 2:
+                continue
+            smooth = self._interpolate_open_curve(seg_pts)
+            ribbon = PosePathRenderer(width=self._bike_lane_width)
+            ribbon.update_from_positions(list(smooth))
+            self._bl_ribbons.append(ribbon)
+        # Restore GL state
+        glUseProgram(int(prev_prog))
+        glBindVertexArray(int(prev_vao))
+
+    # --------------------------------------------------
+    # Ribbon draw calls
+    # --------------------------------------------------
+
+    def draw_cl_ribbon(self, view: np.ndarray, projection: np.ndarray):
+        """Draw the centerline as a purple ribbon."""
+        self._cl_ribbon.draw(view, projection, color=(0.6, 0.0, 0.9, 0.85))
+
+    def draw_bl_ribbons(self, view: np.ndarray, projection: np.ndarray):
+        """Draw all bike-lane segments (active + stored) as green ribbons."""
+        green = (0.0, 0.85, 0.3, 0.85)
+        self._bl_ribbon_active.draw(view, projection, color=green)
+        for ribbon in self._bl_ribbons:
+            ribbon.draw(view, projection, color=green)
+
+    # --------------------------------------------------
+    # Crosswalk add / erase / draw
+    # --------------------------------------------------
+
+    def add_crosswalk_point(self, world_point) -> bool:
+        """
+        Two-click crosswalk placement.
+        First call stores the pending first point and returns False.
+        Second call creates the crosswalk, clears the pending point, returns True.
+        """
+        p = np.array(world_point[:3], dtype=np.float32)
+        p[2] = 0.0
+        if self._crosswalk_pending is None:
+            self._crosswalk_pending = p
+            self._rebuild_cw_spheres(include_pending=True)
+            return False
+        else:
+            cw = np.stack([self._crosswalk_pending, p], axis=0)
+            self._crosswalk_pts.append(cw)
+            self._crosswalk_pending = None
+            self._rebuild_cw_spheres(include_pending=False)
+            return True
+
+    def erase_selected_crosswalk(self):
+        """Remove the crosswalk whose sphere is currently selected."""
+        idx = self._crosswalk_spheres._selected_index
+        if idx < 0:
+            return
+        pair_idx = idx // 2
+        if pair_idx < len(self._crosswalk_pts):
+            del self._crosswalk_pts[pair_idx]
+        self._rebuild_cw_spheres(include_pending=False)
+
+    def rebuild_crosswalk_spheres(self):
+        """Rebuild sphere renderer (clears any pending point)."""
+        self._crosswalk_pending = None
+        self._rebuild_cw_spheres(include_pending=False)
+
+    def _rebuild_cw_spheres(self, include_pending: bool = False):
+        pts = []
+        for cw in self._crosswalk_pts:
+            pts.append(cw[0])
+            pts.append(cw[1])
+        if include_pending and self._crosswalk_pending is not None:
+            pts.append(self._crosswalk_pending)
+        self._crosswalk_spheres.build_from_positions_direct(pts)
+
+    def get_crosswalk_corners(self) -> list:
+        """
+        Returns a list of (4, 3) float32 arrays – one per crosswalk.
+        Corners are ordered for GL_LINE_LOOP.
+        """
+        result = []
+        hw = self._crosswalk_width * 0.5
+        for cw in self._crosswalk_pts:
+            p1, p2 = cw[0], cw[1]
+            dx, dy = float(p2[0] - p1[0]), float(p2[1] - p1[1])
+            L = np.sqrt(dx * dx + dy * dy)
+            if L < 1e-6:
+                continue
+            rx, ry = -dy / L, dx / L
+            result.append(np.array([
+                [p1[0] + rx * hw, p1[1] + ry * hw, 0.0],
+                [p1[0] - rx * hw, p1[1] - ry * hw, 0.0],
+                [p2[0] - rx * hw, p2[1] - ry * hw, 0.0],
+                [p2[0] + rx * hw, p2[1] + ry * hw, 0.0],
+            ], dtype=np.float32))
+        return result
+
+    def sync_crosswalk_sphere(self, sphere_index: int):
+        """Commit the current 3-D position of a moved sphere back to _crosswalk_pts."""
+        pair_idx = sphere_index // 2
+        pt_idx   = sphere_index % 2
+        if pair_idx >= len(self._crosswalk_pts):
+            return
+        pos = self._crosswalk_spheres._centers[sphere_index].copy()
+        pos[2] = 0.0
+        self._crosswalk_pts[pair_idx][pt_idx] = pos
+
+    def draw_crosswalk_spheres(self, view: np.ndarray, projection: np.ndarray):
+        self._crosswalk_spheres.draw(view, projection)
+
+    def draw_bike_lane_spheres(self, view: np.ndarray, projection: np.ndarray):
+        self._bike_lane_spheres.draw(view, projection)

@@ -20,6 +20,7 @@ from CameraLidarModule import CameraLidarModule
 from carModelModule import CarModel
 from ipmModule import IpmModule, TexturedPlane, HDMapBoundaryAccumulator, HDMapGridAccumulator
 from personDetectionModule import PersonDetectionModule
+from hdMapIO import HDMapIO, HDMapData, HDMapRenderer
 
 # ==============================
 # Shaders
@@ -429,6 +430,7 @@ class SceneUI:
         self.show_ipm = False
         self.show_edit_polygon = False  # mapping complete: extract polygon + show spheres for editing
         self._needs_polygon_extract = False  # one-shot: extract when user checks show_edit_polygon
+        self.show_hdmap_panel = False  # toggle the HD Map Settings floating window
 
         self._needs_reload = True
         self._textures = []   # store loaded GL textures
@@ -449,6 +451,22 @@ class SceneUI:
         self._erase_polygon_point_request = False
         self._polygon_mode = None    # None | "add" | "erase"
         self._centerline_mode = None # None | "add" | "erase"
+        self._bike_lane_mode = None  # None | "add" | "erase"
+
+        self.show_bike_lane = False
+        self.bike_lane_width = 1.5   # metres
+        self.cl_ribbon_width = 1.0   # metres (centerline ribbon width)
+
+        self._crosswalk_mode = None  # None | "add" | "erase"
+        self.show_crosswalk = False
+        self.crosswalk_width = 3.0   # metres
+
+        # HD-map persistence
+        self._hdmap_save_path = "hdmap_export.json"
+        self._hdmap_save_requested = False
+        self._hdmap_load_requested = False
+        self._hdmap_status = ""         # last save/load status message
+        self.show_hdmap_render = False  # draw the loaded HD-map snapshot
 
     def load_images_for_scene(self, idx):
         self._textures.clear()
@@ -507,13 +525,8 @@ class SceneUI:
         if changed:
             self._needs_reload = True
         _, self.show_pose = imgui.checkbox("Show Pose", self.show_pose)
-        changed, self.show_ipm = imgui.checkbox("Show IPM", self.show_ipm)
-        if changed:
-            self._needs_reload = True
-
-        changed, self.show_edit_polygon = imgui.checkbox("Mapping complete - Edit polygon", self.show_edit_polygon)
-        if changed and self.show_edit_polygon:
-            self._needs_polygon_extract = True
+        if imgui.button("HD Map Settings"):
+            self.show_hdmap_panel = not self.show_hdmap_panel
 
         # Label Controls
         imgui.text("3D Labels")
@@ -568,33 +581,140 @@ class SceneUI:
         if imgui.button("Save KITTI"):
             self.label_manager.save_kitti()
 
-        imgui.separator()
-        imgui.text("Polygon Edit")
-
-        if imgui.button("Add Vertex"):
-            self._polygon_mode = "add"
-            self._centerline_mode = None
-
-        imgui.same_line()
-
-        if imgui.button("Erase Vertex"):
-            self._polygon_mode = "erase"
-            self._centerline_mode = None
-
-        imgui.separator()
-        imgui.text("Centerline Edit")
-
-        if imgui.button("Add CL Vertex"):
-            self._centerline_mode = "add"
-            self._polygon_mode = None
-
-        imgui.same_line()
-
-        if imgui.button("Erase CL Vertex"):
-            self._centerline_mode = "erase"
-            self._polygon_mode = None
-
         imgui.end()
+
+        # ── HD Map Settings floating panel ────────────────────────────────────
+        if self.show_hdmap_panel:
+            imgui.begin("HD Map Settings", True)
+
+            changed, self.show_ipm = imgui.checkbox("Show IPM", self.show_ipm)
+            if changed:
+                self._needs_reload = True
+
+            changed, self.show_edit_polygon = imgui.checkbox(
+                "Mapping complete - Edit polygon", self.show_edit_polygon
+            )
+            if changed and self.show_edit_polygon:
+                self._needs_polygon_extract = True
+
+            imgui.separator()
+            imgui.text("Polygon Edit")
+
+            if imgui.button("Add Vertex"):
+                self._polygon_mode = "add"
+                self._centerline_mode = None
+
+            imgui.same_line()
+
+            if imgui.button("Erase Vertex"):
+                self._polygon_mode = "erase"
+                self._centerline_mode = None
+
+            imgui.separator()
+            imgui.text("Centerline Edit")
+
+            cl_w_changed, new_cl_w = imgui.slider_float("CL Width (m)", self.cl_ribbon_width, 0.1, 5.0)
+            if cl_w_changed:
+                self.cl_ribbon_width = new_cl_w
+
+            if imgui.button("Add CL Vertex"):
+                self._centerline_mode = "add"
+                self._polygon_mode = None
+                self._bike_lane_mode = None
+
+            imgui.same_line()
+
+            if imgui.button("Erase CL Vertex"):
+                self._centerline_mode = "erase"
+                self._polygon_mode = None
+                self._bike_lane_mode = None
+
+            imgui.separator()
+            imgui.text("Bike Lane")
+
+            _, self.show_bike_lane = imgui.checkbox("Show Bike Lane", self.show_bike_lane)
+
+            width_changed, new_width = imgui.slider_float("BL Width (m)", self.bike_lane_width, 0.5, 6.0)
+            if width_changed:
+                self.bike_lane_width = new_width
+
+            if imgui.button("Add BL Vertex"):
+                self._bike_lane_mode = "add"
+                self._polygon_mode = None
+                self._centerline_mode = None
+
+            imgui.same_line()
+
+            if imgui.button("Erase BL Vertex"):
+                self._bike_lane_mode = "erase"
+                self._polygon_mode = None
+                self._centerline_mode = None
+
+            if imgui.button("Store BL Segment"):
+                self._bike_lane_mode = "store"
+
+            imgui.same_line()
+
+            if imgui.button("Clear All BL"):
+                self._bike_lane_mode = "clear_all"
+
+            # ── Crosswalk ───────────────────────────────────────────────────
+            imgui.separator()
+            imgui.text("Crosswalk")
+
+            _, self.show_crosswalk = imgui.checkbox("Show Crosswalks", self.show_crosswalk)
+
+            cw_w_changed, cw_w_new = imgui.slider_float("CW Width (m)", self.crosswalk_width, 1.0, 10.0)
+            if cw_w_changed:
+                self.crosswalk_width = cw_w_new
+
+            if imgui.button("Add Crosswalk"):
+                self._crosswalk_mode = "add"
+                self._polygon_mode = None
+                self._centerline_mode = None
+                self._bike_lane_mode = None
+
+            imgui.same_line()
+
+            if imgui.button("Erase Crosswalk"):
+                self._crosswalk_mode = "erase"
+                self._polygon_mode = None
+                self._centerline_mode = None
+                self._bike_lane_mode = None
+
+            if imgui.button("Clear All CW"):
+                self._crosswalk_mode = "clear_cw"
+
+            # crosswalk pending indicator
+            if self._crosswalk_mode == "add":
+                imgui.text_colored("Click map: pt 1 (then pt 2)", 1.0, 0.9, 0.2, 1.0)
+
+            # ── Render loaded snapshot ───────────────────────────────────────
+            imgui.separator()
+            _, self.show_hdmap_render = imgui.checkbox(
+                "Show Loaded HD Map", self.show_hdmap_render
+            )
+
+            # ── Save / Load ──────────────────────────────────────────────────
+            imgui.separator()
+            imgui.text("HD Map File")
+
+            changed, new_path = imgui.input_text("##hdmap_path", self._hdmap_save_path, 512)
+            if changed:
+                self._hdmap_save_path = new_path
+
+            if imgui.button("Save HD Map"):
+                self._hdmap_save_requested = True
+
+            imgui.same_line()
+
+            if imgui.button("Load HD Map"):
+                self._hdmap_load_requested = True
+
+            if self._hdmap_status:
+                imgui.text_colored(self._hdmap_status, 0.4, 1.0, 0.4, 1.0)
+
+            imgui.end()
 
         # Images panel
         imgui.begin("Images Panel", True)
@@ -617,6 +737,10 @@ class SceneUI:
 
     def consume_centerline_mode(self):
         mode = self._centerline_mode
+        return mode
+
+    def consume_bike_lane_mode(self):
+        mode = self._bike_lane_mode
         return mode
 
     def consume_reload_flag(self):
@@ -731,6 +855,20 @@ class Viz:
         self._path_left = None
         self._path_right = None
 
+        # Standalone renderer for the last loaded / saved HD-map snapshot
+        self._hd_map_renderer = HDMapRenderer(
+            cl_width=self._ui.cl_ribbon_width,
+            bl_width=self._ui.bike_lane_width,
+        )
+
+        # Bike-lane visuals (orange centre + left/right boundaries)
+        self._bike_lane_center = None          # active segment smooth curve
+        self._bike_lane_left = None
+        self._bike_lane_right = None
+        # stored segments: list of (center, left, right) np.ndarray tuples
+        self._bike_lane_stored: list = []
+        self._bike_lane_width_prev = self._ui.bike_lane_width
+
         self._lidar_model = np.identity(4, dtype=np.float32)
         self._basefootprint_model = np.identity(4, dtype=np.float32)
         self.model_ipm_plane = np.identity(4, dtype=np.float32)
@@ -775,6 +913,130 @@ class Viz:
 
     def set_pointcloud(self, xyz: np.ndarray):
         self._pointcloud.update(xyz)
+
+    def _sync_cl_ribbon(self):
+        """Push the current _path_center into the purple centerline ribbon renderer."""
+        self._hd_grid_acc._cl_ribbon_width = self._ui.cl_ribbon_width
+        self._hd_grid_acc.update_cl_ribbon(self._path_center)
+
+    def _refresh_bike_lane(self):
+        """Recompute smooth curves + boundaries for active segment and all stored segments."""
+        acc = self._hd_grid_acc
+        w = self._ui.bike_lane_width
+
+        # Active segment
+        if acc._bike_lane_pts is not None and len(acc._bike_lane_pts) >= 2:
+            smooth = acc.get_smooth_bike_lane()
+            self._bike_lane_center = smooth
+            if smooth is not None and len(smooth) >= 2:
+                self._bike_lane_left, self._bike_lane_right = \
+                    acc.compute_left_right_from_centerline(smooth, w)
+            else:
+                self._bike_lane_left = self._bike_lane_right = None
+            acc.update_bl_active_ribbon(smooth)
+        else:
+            self._bike_lane_center = None
+            self._bike_lane_left = self._bike_lane_right = None
+            acc.update_bl_active_ribbon(None)
+
+        # Stored segments
+        self._bike_lane_stored = []
+        for seg_pts in acc._bike_lane_segments:
+            if len(seg_pts) < 2:
+                continue
+            smooth = acc._interpolate_open_curve(seg_pts)
+            if smooth is not None and len(smooth) >= 2:
+                left, right = acc.compute_left_right_from_centerline(smooth, w)
+            else:
+                left = right = None
+            self._bike_lane_stored.append((smooth, left, right))
+
+    # ------------------------------------------------------------------
+    # HD-map persistence helpers
+    # ------------------------------------------------------------------
+
+    def _collect_hdmap_data(self) -> HDMapData:
+        """Snapshot current editable HD-map state into an HDMapData object."""
+        acc = self._hd_grid_acc
+        return HDMapData(
+            polygons=[p.copy() for p in acc._polygons_editable] if acc._polygons_editable else [],
+            centerline=acc._centerline_pts.copy() if acc._centerline_pts is not None else None,
+            bike_lane_segments=[s.copy() for s in acc._bike_lane_segments],
+            bike_lane_active=acc._bike_lane_pts.copy() if acc._bike_lane_pts is not None else None,
+            bike_lane_width=float(self._ui.bike_lane_width),
+            crosswalks=[c.copy() for c in acc._crosswalk_pts],
+            crosswalk_width=float(self._ui.crosswalk_width),
+        )
+
+    def _apply_hdmap_data(self, data: HDMapData) -> None:
+        """Restore editable HD-map state from an HDMapData object."""
+        acc = self._hd_grid_acc
+
+        # ── Polygons ──────────────────────────────────────────────────────
+        if data.polygons:
+            valid = [p for p in data.polygons if p is not None and len(p) >= 3]
+            acc._polygons_editable = [p.copy() for p in valid]
+            acc._polygons_edited = True
+            acc.rebuild_spheres_from_editable()
+            if acc._edit_snapshot_conf is not None:
+                acc.rasterize_edited_polygons_to_grid()
+                rgba = acc.to_rgba(alpha_scale=220)
+                self._hd_grid_plane.set_texture_rgba(rgba)
+            self._polys = acc.get_editable_polygons() or []
+            self._ui.show_edit_polygon = True
+
+        # ── Centerline ────────────────────────────────────────────────────
+        if data.centerline is not None and len(data.centerline) >= 2:
+            acc._centerline_pts = data.centerline.copy()
+            acc._centerline_edited = True
+            acc.rebuild_centerline_spheres()
+            cl_smooth = acc.get_smooth_centerline()
+            self._path_center = cl_smooth if cl_smooth is not None else data.centerline.copy()
+            self._sync_cl_ribbon()
+            if self._polys and self._path_center is not None and len(self._path_center) >= 2:
+                left, right = acc.split_polygon_left_right_from_centerline(
+                    polygon_world=self._polys[0],
+                    centerline_world=self._path_center,
+                )
+                self._path_left, self._path_right = left, right
+
+        # ── Bike-lane segments ────────────────────────────────────────────
+        acc._bike_lane_segments = [
+            s.copy() for s in data.bike_lane_segments if s is not None and len(s) >= 2
+        ]
+
+        # ── Bike-lane active segment ──────────────────────────────────────
+        if data.bike_lane_active is not None and len(data.bike_lane_active) >= 2:
+            acc._bike_lane_pts = data.bike_lane_active.copy()
+            acc.rebuild_bike_lane_spheres()
+        else:
+            acc._bike_lane_pts = None
+            acc._bike_lane_spheres.build_from_positions_direct([])
+
+        # ── Width + visual refresh ────────────────────────────────────────
+        self._ui.bike_lane_width = data.bike_lane_width
+        self._bike_lane_width_prev = data.bike_lane_width
+        acc._bike_lane_width = data.bike_lane_width
+        self._refresh_bike_lane()
+        acc.rebuild_bike_lane_ribbons()   # create GPU ribbons for all loaded stored segments
+
+        if data.bike_lane_segments or data.bike_lane_active is not None:
+            self._ui.show_bike_lane = True
+
+        # ── Crosswalks ────────────────────────────────────────────────────
+        acc._crosswalk_pts = [
+            c.copy() for c in data.crosswalks
+            if c is not None and np.asarray(c).shape == (2, 3)
+        ]
+        acc._crosswalk_pending = None
+        acc.rebuild_crosswalk_spheres()
+        acc._crosswalk_width = data.crosswalk_width
+        self._ui.crosswalk_width = data.crosswalk_width
+        if acc._crosswalk_pts:
+            self._ui.show_crosswalk = True
+
+        # Make sure the HD-map panel is visible so the user sees what loaded
+        self._ui.show_hdmap_panel = True
 
     def screen_to_world_ray(self, mouse_x, mouse_y, width, height, inv_proj, inv_view, cam_pos):
         x = (2.0 * mouse_x) / width - 1.0
@@ -821,6 +1083,68 @@ class Viz:
 
             io = imgui.get_io()
 
+            # Recompute bike-lane boundaries whenever the width slider changes
+            if self._ui.show_bike_lane and self._ui.bike_lane_width != self._bike_lane_width_prev:
+                self._bike_lane_width_prev = self._ui.bike_lane_width
+                self._hd_grid_acc._bike_lane_width = self._ui.bike_lane_width
+                self._refresh_bike_lane()
+                self._hd_grid_acc.rebuild_bike_lane_ribbons()  # update stored-segment ribbon widths
+
+            # Recompute centerline ribbon whenever its width slider changes
+            if self._ui.cl_ribbon_width != self._hd_grid_acc._cl_ribbon_width:
+                self._sync_cl_ribbon()
+
+            # Handle immediate bike-lane button actions (store / clear all)
+            bl_mode = self._ui._bike_lane_mode
+            if bl_mode == "store":
+                self._hd_grid_acc.store_bike_lane_segment()
+                self._refresh_bike_lane()
+                self._ui._bike_lane_mode = None
+            elif bl_mode == "clear_all":
+                self._hd_grid_acc.clear_all_bike_lane_segments()
+                self._refresh_bike_lane()
+                self._ui._bike_lane_mode = None
+
+            # Handle crosswalk width slider changes
+            if self._ui.show_crosswalk and self._ui.crosswalk_width != self._hd_grid_acc._crosswalk_width:
+                self._hd_grid_acc._crosswalk_width = self._ui.crosswalk_width
+
+            # Handle "Clear All Crosswalks"
+            if self._ui._crosswalk_mode == "clear_cw":
+                self._hd_grid_acc._crosswalk_pts = []
+                self._hd_grid_acc.rebuild_crosswalk_spheres()
+                self._ui._crosswalk_mode = None
+
+            # Handle HD-map save / load requests
+            if self._ui._hdmap_save_requested:
+                self._ui._hdmap_save_requested = False
+                try:
+                    data = self._collect_hdmap_data()
+                    HDMapIO.save(self._ui._hdmap_save_path, data)
+                    self._hd_map_renderer.update(
+                        data,
+                        cl_width=self._ui.cl_ribbon_width,
+                        bl_width=self._ui.bike_lane_width,
+                    )
+                    self._ui._hdmap_status = f"Saved  ({HDMapIO.summary(data)})"
+                except Exception as exc:
+                    self._ui._hdmap_status = f"Save error: {exc}"
+
+            if self._ui._hdmap_load_requested:
+                self._ui._hdmap_load_requested = False
+                try:
+                    data = HDMapIO.load(self._ui._hdmap_save_path)
+                    self._apply_hdmap_data(data)
+                    self._hd_map_renderer.update(
+                        data,
+                        cl_width=self._ui.cl_ribbon_width,
+                        bl_width=self._ui.bike_lane_width,
+                    )
+                    self._ui.show_hdmap_render = True   # auto-show after load
+                    self._ui._hdmap_status = f"Loaded  ({HDMapIO.summary(data)})"
+                except Exception as exc:
+                    self._ui._hdmap_status = f"Load error: {exc}"
+
             # --------------------------------------------------
             # Mouse handling
             # --------------------------------------------------
@@ -849,21 +1173,41 @@ class Viz:
                         inv_proj, inv_view, cam_pos_world
                     )
 
-                    if not self._ui._live_topic_mode and self._ui.show_edit_polygon:
+                    if not self._ui._live_topic_mode:
+                        best_t    = float("inf")
+                        best_kind = None
+                        best_idx  = -1
 
-                        polygon_result = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos, ray_dir)
-                        cl_result      = self._hd_grid_acc._centerline_spheres.intersect_ray(cam_pos, ray_dir)
-                        poly_t = polygon_result[1] if polygon_result is not None else float("inf")
-                        cl_t   = cl_result[1]      if cl_result      is not None else float("inf")
+                        if self._ui.show_edit_polygon:
+                            poly_res = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos, ray_dir)
+                            cl_res   = self._hd_grid_acc._centerline_spheres.intersect_ray(cam_pos, ray_dir)
+                            if poly_res is not None and poly_res[1] < best_t:
+                                best_t = poly_res[1]; best_kind = "polygon"; best_idx = poly_res[0]
+                            if cl_res is not None and cl_res[1] < best_t:
+                                best_t = cl_res[1]; best_kind = "centerline"; best_idx = cl_res[0]
 
-                        if polygon_result is not None and poly_t <= cl_t:
-                            polygon_idx, _ = polygon_result
-                            self._hd_grid_acc._polygon_spheres.select(polygon_idx)
+                        if self._ui.show_bike_lane:
+                            bl_res = self._hd_grid_acc._bike_lane_spheres.intersect_ray(cam_pos, ray_dir)
+                            if bl_res is not None and bl_res[1] < best_t:
+                                best_t = bl_res[1]; best_kind = "bike_lane"; best_idx = bl_res[0]
+
+                        if self._ui.show_crosswalk:
+                            cw_res = self._hd_grid_acc._crosswalk_spheres.intersect_ray(cam_pos, ray_dir)
+                            if cw_res is not None and cw_res[1] < best_t:
+                                best_t = cw_res[1]; best_kind = "crosswalk"; best_idx = cw_res[0]
+
+                        if best_kind == "polygon":
+                            self._hd_grid_acc._polygon_spheres.select(best_idx)
                             self._hd_grid_acc._polygon_spheres.begin_drag(cam_pos, ray_dir)
-                        elif cl_result is not None:
-                            cl_idx, _ = cl_result
-                            self._hd_grid_acc._centerline_spheres.select(cl_idx)
+                        elif best_kind == "centerline":
+                            self._hd_grid_acc._centerline_spheres.select(best_idx)
                             self._hd_grid_acc._centerline_spheres.begin_drag(cam_pos, ray_dir)
+                        elif best_kind == "bike_lane":
+                            self._hd_grid_acc._bike_lane_spheres.select(best_idx)
+                            self._hd_grid_acc._bike_lane_spheres.begin_drag(cam_pos, ray_dir)
+                        elif best_kind == "crosswalk":
+                            self._hd_grid_acc._crosswalk_spheres.select(best_idx)
+                            self._hd_grid_acc._crosswalk_spheres.begin_drag(cam_pos, ray_dir)
 
                 # -----------------------------
                 # LEFT RELEASE (click select OR finish drag)
@@ -946,6 +1290,7 @@ class Viz:
                                     cl_smooth = self._hd_grid_acc.get_smooth_centerline()
                                     if cl_smooth is not None:
                                         self._path_center = cl_smooth
+                                    self._sync_cl_ribbon()
                                     if self._polys and self._path_center is not None and len(self._path_center) >= 2:
                                         left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
                                             polygon_world=self._polys[0],
@@ -956,6 +1301,50 @@ class Viz:
                                         self._path_left, self._path_right = None, None
 
                                     self._ui._centerline_mode = None
+                                    handled_polygon_mode = True
+
+                                # Bike-lane add / erase
+                                bike_lane_mode = self._ui.consume_bike_lane_mode()
+                                if bike_lane_mode is not None and self._ui.show_bike_lane:
+                                    if bike_lane_mode == "add":
+                                        if abs(ray_dir[2]) > 1e-6:
+                                            t = -cam_pos[2] / ray_dir[2]
+                                            hit = cam_pos + t * ray_dir
+                                        else:
+                                            hit = None
+                                        if hit is not None:
+                                            self._hd_grid_acc.add_vertex_to_bike_lane(hit)
+
+                                    elif bike_lane_mode == "erase":
+                                        self._hd_grid_acc.erase_selected_bike_lane_vertex()
+
+                                    self._hd_grid_acc.rebuild_bike_lane_spheres()
+                                    self._refresh_bike_lane()
+                                    self._ui._bike_lane_mode = None
+                                    handled_polygon_mode = True
+
+                                # Crosswalk add / erase
+                                cw_mode = self._ui._crosswalk_mode
+                                if cw_mode is not None and self._ui.show_crosswalk and cw_mode in ("add", "erase"):
+                                    if cw_mode == "add":
+                                        if abs(ray_dir[2]) > 1e-6:
+                                            t_gnd = -cam_pos[2] / ray_dir[2]
+                                            hit = cam_pos + t_gnd * ray_dir
+                                        else:
+                                            hit = None
+                                        if hit is not None:
+                                            completed = self._hd_grid_acc.add_crosswalk_point(hit)
+                                            if completed:
+                                                self._ui._crosswalk_mode = None
+                                            # else: keep "add" mode — waiting for second click
+
+                                    elif cw_mode == "erase":
+                                        cw_res = self._hd_grid_acc._crosswalk_spheres.intersect_ray(cam_pos, ray_dir)
+                                        if cw_res is not None:
+                                            self._hd_grid_acc._crosswalk_spheres.select(cw_res[0])
+                                            self._hd_grid_acc.erase_selected_crosswalk()
+                                        self._ui._crosswalk_mode = None
+
                                     handled_polygon_mode = True
 
                             if not handled_polygon_mode:
@@ -1013,6 +1402,14 @@ class Viz:
                         was_cl_dragging = self._hd_grid_acc._centerline_spheres._dragging
                         self._hd_grid_acc._centerline_spheres.end_drag()
 
+                        bl_drag_idx = self._hd_grid_acc._bike_lane_spheres._selected_index
+                        was_bl_dragging = self._hd_grid_acc._bike_lane_spheres._dragging
+                        self._hd_grid_acc._bike_lane_spheres.end_drag()
+
+                        cw_drag_idx = self._hd_grid_acc._crosswalk_spheres._selected_index
+                        was_cw_dragging = self._hd_grid_acc._crosswalk_spheres._dragging
+                        self._hd_grid_acc._crosswalk_spheres.end_drag()
+
                         if self._ui.show_edit_polygon and was_dragging and drag_idx >= 0:
                             self._hd_grid_acc.sync_sphere_to_polygon(drag_idx)
                             self._hd_grid_acc.rasterize_edited_polygons_to_grid()
@@ -1034,6 +1431,7 @@ class Viz:
                             cl_smooth = self._hd_grid_acc.get_smooth_centerline()
                             if cl_smooth is not None:
                                 self._path_center = cl_smooth
+                            self._sync_cl_ribbon()
                             if self._polys and self._path_center is not None and len(self._path_center) >= 2:
                                 left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
                                     polygon_world=self._polys[0],
@@ -1042,6 +1440,13 @@ class Viz:
                                 self._path_left, self._path_right = left, right
                             else:
                                 self._path_left, self._path_right = None, None
+
+                        if self._ui.show_bike_lane and was_bl_dragging and bl_drag_idx >= 0:
+                            self._hd_grid_acc.sync_bike_lane_sphere(bl_drag_idx)
+                            self._refresh_bike_lane()
+
+                        if self._ui.show_crosswalk and was_cw_dragging and cw_drag_idx >= 0:
+                            self._hd_grid_acc.sync_crosswalk_sphere(cw_drag_idx)
 
                     self._mouse_pressed = False
 
@@ -1093,6 +1498,7 @@ class Viz:
                             cl_smooth = self._hd_grid_acc.get_smooth_centerline()
                             if cl_smooth is not None:
                                 self._path_center = cl_smooth
+                            self._sync_cl_ribbon()
                             if self._polys and self._path_center is not None and len(self._path_center) >= 2:
                                 left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
                                     polygon_world=self._polys[0],
@@ -1101,6 +1507,39 @@ class Viz:
                                 self._path_left, self._path_right = left, right
                             else:
                                 self._path_left, self._path_right = None, None
+
+                    elif self._hd_grid_acc._bike_lane_spheres._dragging and not self._ui._live_topic_mode and self._ui.show_bike_lane:
+                        # Drag a bike-lane sphere
+                        inv_proj = np.linalg.inv(proj)
+                        inv_view = np.linalg.inv(view)
+                        cam_pos_world = inv_view[:3, 3]
+
+                        cam_pos, ray_dir = self.screen_to_world_ray(
+                            x, y, width, height,
+                            inv_proj, inv_view, cam_pos_world
+                        )
+
+                        self._hd_grid_acc._bike_lane_spheres.drag(cam_pos, ray_dir)
+                        idx = self._hd_grid_acc._bike_lane_spheres._selected_index
+                        if idx >= 0:
+                            self._hd_grid_acc.sync_bike_lane_sphere(idx)
+                            self._refresh_bike_lane()
+
+                    elif self._hd_grid_acc._crosswalk_spheres._dragging and not self._ui._live_topic_mode and self._ui.show_crosswalk:
+                        # Drag a crosswalk endpoint sphere
+                        inv_proj = np.linalg.inv(proj)
+                        inv_view = np.linalg.inv(view)
+                        cam_pos_world = inv_view[:3, 3]
+
+                        cam_pos, ray_dir = self.screen_to_world_ray(
+                            x, y, width, height,
+                            inv_proj, inv_view, cam_pos_world
+                        )
+
+                        self._hd_grid_acc._crosswalk_spheres.drag(cam_pos, ray_dir)
+                        idx = self._hd_grid_acc._crosswalk_spheres._selected_index
+                        if idx >= 0:
+                            self._hd_grid_acc.sync_crosswalk_sphere(idx)
 
                     else:
                         # Pure camera movement (NO ray math)
@@ -1142,6 +1581,17 @@ class Viz:
                         self._hd_grid_acc._centerline_edited = False
                         self._ui._polygon_mode = None
                         self._ui._centerline_mode = None
+
+                    if self._ui.show_bike_lane and glfw.get_key(self._window, glfw.KEY_ESCAPE) == glfw.PRESS:
+                        self._hd_grid_acc._bike_lane_spheres.end_drag()
+                        self._hd_grid_acc._bike_lane_spheres.select(-1)
+                        self._ui._bike_lane_mode = None
+
+                    if self._ui.show_crosswalk and glfw.get_key(self._window, glfw.KEY_ESCAPE) == glfw.PRESS:
+                        # Cancel crosswalk placement (pending first point is also cleared)
+                        self._hd_grid_acc._crosswalk_pending = None
+                        self._hd_grid_acc._rebuild_cw_spheres(include_pending=False)
+                        self._ui._crosswalk_mode = None
 
                     if glfw.get_key(self._window, glfw.KEY_UP) == glfw.PRESS:
                         self._labels.move_selected_local(speed, 0, 0); moved = True
@@ -1252,6 +1702,7 @@ class Viz:
                                 self._hd_grid_acc.update_centerline_spheres(center)
                             _cl_smooth = self._hd_grid_acc.get_smooth_centerline()
                             self._path_center = _cl_smooth if _cl_smooth is not None else center
+                            self._sync_cl_ribbon()
                             left, right = None, None
                             if self._polys and len(self._path_center) >= 2:
                                 poly = self._polys[0]
@@ -1264,6 +1715,7 @@ class Viz:
                         else:
                             self._polys = []
                             self._path_center = center
+                            self._sync_cl_ribbon()
                             self._path_left = None
                             self._path_right = None
 
@@ -1289,6 +1741,7 @@ class Viz:
                             self._hd_grid_acc.update_centerline_spheres(center)
                         _cl_smooth = self._hd_grid_acc.get_smooth_centerline()
                         self._path_center = _cl_smooth if _cl_smooth is not None else center
+                        self._sync_cl_ribbon()
                         left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
                             polygon_world=self._polys[0],
                             centerline_world=self._path_center
@@ -1378,7 +1831,29 @@ class Viz:
 
                         self._hd_grid_acc.draw_polygon_spheres(view.T, proj.T)
                         self._hd_grid_acc.draw_centerline_spheres(view.T, proj.T)
+                        # Centerline ribbon (purple)
+                        self._hd_grid_acc.draw_cl_ribbon(view.T, proj.T)
 
+                    # Bike-lane spheres + green ribbons
+                    if self._ui.show_bike_lane:
+                        self._hd_grid_acc.draw_bike_lane_spheres(view.T, proj.T)
+                        self._hd_grid_acc.draw_bl_ribbons(view.T, proj.T)
+
+                    # Crosswalk rectangles (white) + spheres
+                    if self._ui.show_crosswalk:
+                        corners_list = self._hd_grid_acc.get_crosswalk_corners()
+                        if corners_list:
+                            glUseProgram(self._program)
+                            self._set_model_color(identity, 1.0, 1.0, 1.0, 1.0)
+                            glLineWidth(3.0)
+                            for corners in corners_list:
+                                glBegin(GL_LINE_LOOP)
+                                for c in corners:
+                                    glVertex3f(float(c[0]), float(c[1]), float(c[2]) + 0.07)
+                                glEnd()
+                            glLineWidth(1.0)
+                        self._hd_grid_acc.draw_crosswalk_spheres(view.T, proj.T)
+                        glUseProgram(self._program)
 
                     if self._path_center is not None and len(self._path_center) >= 2:
                         z_lift = 0.05
@@ -1404,6 +1879,46 @@ class Viz:
                                 glVertex3f(p[0], p[1], p[2] + z_lift)
                             glEnd()
                         glLineWidth(1.0)
+
+                    # Bike-lane lines (orange centre + light/dark orange boundaries)
+                    if self._ui.show_bike_lane:
+                        z_lift = 0.06
+                        glUseProgram(self._program)
+                        glLineWidth(3.0)
+
+                        def _draw_bl_curve(center, left, right):
+                            if center is not None and len(center) >= 2:
+                                self._set_model_color(identity, 1.0, 0.55, 0.0, 1.0)  # orange centre
+                                glBegin(GL_LINE_STRIP)
+                                for p in center:
+                                    glVertex3f(p[0], p[1], p[2] + z_lift)
+                                glEnd()
+                            if left is not None:
+                                self._set_model_color(identity, 1.0, 0.82, 0.4, 1.0)  # light orange
+                                glBegin(GL_LINE_STRIP)
+                                for p in left:
+                                    glVertex3f(p[0], p[1], p[2] + z_lift)
+                                glEnd()
+                            if right is not None:
+                                self._set_model_color(identity, 0.80, 0.35, 0.0, 1.0)  # dark orange
+                                glBegin(GL_LINE_STRIP)
+                                for p in right:
+                                    glVertex3f(p[0], p[1], p[2] + z_lift)
+                                glEnd()
+
+                        # Active segment
+                        _draw_bl_curve(self._bike_lane_center, self._bike_lane_left, self._bike_lane_right)
+
+                        # All stored segments
+                        for (sc, sl, sr) in self._bike_lane_stored:
+                            _draw_bl_curve(sc, sl, sr)
+
+                        glLineWidth(1.0)
+
+                # Loaded HD-map snapshot — independent of IPM / grid texture
+                if self._ui.show_hdmap_render:
+                    self._hd_map_renderer.draw(view.T, proj.T)
+                    glUseProgram(self._program)  # restore main program after renderer
 
                 # Point Cloud: transformed to world space via ego-pose; labels stay at lidar origin
                 glUseProgram(self._program_points)
