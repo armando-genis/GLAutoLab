@@ -593,6 +593,11 @@ class HDMapGridAccumulator:
 
         self._polygon_spheres = PathSphereMarkerRenderer(radius = 0.20, color = (0.0, 1.0, 0.3, 0.9), drag_enabled = True)
 
+        # Editable centerline spheres
+        self._centerline_spheres = PathSphereMarkerRenderer(radius=0.15, color=(1.0, 1.0, 0.0, 0.9), drag_enabled=True)
+        self._centerline_pts: Optional[np.ndarray] = None
+        self._centerline_edited = False
+
         # Editable polygon representation: list of (N,3) arrays (2m-sampled points per polygon)
         self._polygons_editable: list[np.ndarray] = []
         # For each sphere index: (poly_idx, point_idx within that polygon's sampled points)
@@ -941,6 +946,154 @@ class HDMapGridAccumulator:
     def draw_polygon_spheres(self, view: np.ndarray, projection: np.ndarray):
         self._polygon_spheres.draw(view, projection)
 
+    def sample_polyline_every(self, pts_3d: np.ndarray, step_m: float = 1.0):
+        """
+        Sample an OPEN polyline at step_m intervals (no loop closure).
+        Always includes the first and last point.
+        """
+        if len(pts_3d) < 2:
+            return list(pts_3d)
+
+        pts = [np.asarray(p, dtype=np.float32) for p in pts_3d]
+
+        lengths = []
+        total_length = 0.0
+        for i in range(len(pts) - 1):
+            seg_len = float(np.linalg.norm(pts[i + 1] - pts[i]))
+            lengths.append(seg_len)
+            total_length += seg_len
+
+        if total_length < step_m:
+            return [pts[0], pts[-1]]
+
+        out = [pts[0].copy()]
+        dist = step_m
+        accum = 0.0
+
+        for i in range(len(pts) - 1):
+            p0 = pts[i]
+            p1 = pts[i + 1]
+            seg = p1 - p0
+            seg_len = lengths[i]
+
+            while accum + seg_len >= dist:
+                t = (dist - accum) / seg_len
+                out.append(p0 + seg * t)
+                dist += step_m
+
+            accum += seg_len
+
+        out.append(pts[-1].copy())
+        return out
+
+    def update_centerline_spheres(self, positions: np.ndarray):
+        """
+        Resample the centerline at 1 m intervals and build one draggable yellow
+        sphere per sample point (same ground level as polygon spheres).
+        """
+        if positions is None or len(positions) < 2:
+            return
+        sampled = self.sample_polyline_every(positions, step_m=1.0)
+        self._centerline_pts = np.asarray(sampled, dtype=np.float32)
+        self._centerline_pts[:, 2] = 0.0   # force ground plane
+        self._centerline_edited = False
+        self._centerline_spheres.build_from_positions_direct(list(self._centerline_pts))
+
+    def sync_centerline_sphere(self, sphere_index: int):
+        """
+        Commit the moved sphere position into _centerline_pts (z forced to 0).
+        No smoothing: only the dragged point moves, neighbours are untouched.
+        The GPU buffer for this sphere is already updated by drag(), so no extra
+        GL work is needed here.
+        """
+        if self._centerline_pts is None:
+            return
+        if sphere_index < 0 or sphere_index >= len(self._centerline_pts):
+            return
+        pos = self._centerline_spheres._centers[sphere_index].copy()
+        pos[2] = 0.0
+        self._centerline_pts[sphere_index] = pos
+        self._centerline_edited = True
+
+    def get_edited_centerline(self) -> Optional[np.ndarray]:
+        """Return the raw control-point centerline, or None if not set."""
+        return self._centerline_pts
+
+    def get_smooth_centerline(self, samples_per_seg: int = 5) -> Optional[np.ndarray]:
+        """
+        Return a smooth open Catmull-Rom spline through the centerline control
+        points.  Use this for drawing the yellow path line and computing the
+        left/right split so the car path stays smooth even after editing.
+        """
+        if self._centerline_pts is None or len(self._centerline_pts) < 2:
+            return self._centerline_pts
+        return self._interpolate_open_curve(self._centerline_pts, samples_per_seg=samples_per_seg)
+
+    def draw_centerline_spheres(self, view: np.ndarray, projection: np.ndarray):
+        self._centerline_spheres.draw(view, projection)
+
+    def _interpolate_open_curve(self, pts: np.ndarray, samples_per_seg: int = 5) -> np.ndarray:
+        """
+        Open Catmull-Rom spline.  Phantom endpoints are clamped (first/last point
+        repeated) so the curve starts and ends exactly at the control points.
+        """
+        N = len(pts)
+        if N < 2:
+            return pts
+
+        dense = []
+        for i in range(N - 1):
+            p0 = pts[max(0, i - 1)]
+            p1 = pts[i]
+            p2 = pts[i + 1]
+            p3 = pts[min(N - 1, i + 2)]
+
+            for t in np.linspace(0, 1, samples_per_seg, endpoint=False):
+                t2 = t * t
+                t3 = t2 * t
+                point = 0.5 * (
+                    (2 * p1)
+                    + (-p0 + p2) * t
+                    + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
+                    + (-p0 + 3 * p1 - 3 * p2 + p3) * t3
+                )
+                dense.append(point)
+
+        dense.append(pts[-1].copy())
+        return np.asarray(dense, dtype=np.float32)
+
+    def _smooth_local_segment_open(
+        self,
+        pts: np.ndarray,
+        center_idx: int,
+        radius: int = 2,
+    ):
+        """
+        Smooth a local window of an OPEN polyline (clamps at endpoints, no wrap).
+        """
+        N = len(pts)
+        if N < 3:
+            return
+
+        original = pts.copy()
+
+        for k in range(-radius, radius + 1):
+            idx = center_idx + k
+            if idx < 0 or idx >= N:
+                continue
+
+            acc = np.zeros(3, dtype=np.float32)
+            count = 0
+
+            for j in range(-radius, radius + 1):
+                neighbor = idx + j
+                if 0 <= neighbor < N:
+                    acc += original[neighbor]
+                    count += 1
+
+            if count > 0:
+                pts[idx] = acc / count
+
     def _smooth_local_segment(
         self,
         poly: np.ndarray,
@@ -948,7 +1101,7 @@ class HDMapGridAccumulator:
         radius: int = 2
     ):
         """
-        Smooth only a local window around center_idx.
+        Smooth only a local window around center_idx (closed polygon, wraps).
         radius = how many neighbors on each side.
         """
 
@@ -1172,3 +1325,59 @@ class HDMapGridAccumulator:
                 self._sphere_to_poly.append((pi, pj))
 
         self._polygon_spheres.build_from_positions_direct(all_pts)
+
+    # --------------------------------------------------
+    # Centerline vertex add / erase
+    # --------------------------------------------------
+
+    def add_vertex_to_centerline(self, world_point):
+        """
+        Insert a new control point into the centerline at the nearest edge
+        (open polyline: nearest segment between consecutive points).
+        """
+        if self._centerline_pts is None or len(self._centerline_pts) < 2:
+            return
+
+        p = np.array(world_point[:3], dtype=np.float32)
+        p[2] = 0.0
+
+        pts = self._centerline_pts
+        min_dist = float("inf")
+        insert_idx = 1  # default: after first point
+
+        for i in range(len(pts) - 1):
+            p0 = pts[i]
+            p1 = pts[i + 1]
+            v = p1 - p0
+            w = p - p0
+            c1 = np.dot(w, v)
+            c2 = np.dot(v, v)
+            if c1 <= 0:
+                dist = float(np.linalg.norm(p - p0))
+            elif c2 <= c1:
+                dist = float(np.linalg.norm(p - p1))
+            else:
+                b = c1 / c2
+                dist = float(np.linalg.norm(p - (p0 + b * v)))
+            if dist < min_dist:
+                min_dist = dist
+                insert_idx = i + 1
+
+        self._centerline_pts = np.insert(pts, insert_idx, p, axis=0)
+        self._centerline_edited = True
+
+    def erase_selected_centerline_vertex(self):
+        """Remove the currently selected centerline sphere's control point."""
+        idx = self._centerline_spheres._selected_index
+        if idx < 0:
+            return
+        if self._centerline_pts is None or len(self._centerline_pts) <= 2:
+            return  # must keep at least 2 points
+        self._centerline_pts = np.delete(self._centerline_pts, idx, axis=0)
+        self._centerline_edited = True
+
+    def rebuild_centerline_spheres(self):
+        """Rebuild sphere renderer from current _centerline_pts after add/erase."""
+        if self._centerline_pts is None:
+            return
+        self._centerline_spheres.build_from_positions_direct(list(self._centerline_pts))

@@ -447,7 +447,8 @@ class SceneUI:
 
         self._add_polygon_point_request = False
         self._erase_polygon_point_request = False
-        self._polygon_mode = None   # None | "add" | "erase"
+        self._polygon_mode = None    # None | "add" | "erase"
+        self._centerline_mode = None # None | "add" | "erase"
 
     def load_images_for_scene(self, idx):
         self._textures.clear()
@@ -572,11 +573,26 @@ class SceneUI:
 
         if imgui.button("Add Vertex"):
             self._polygon_mode = "add"
+            self._centerline_mode = None
 
         imgui.same_line()
 
         if imgui.button("Erase Vertex"):
             self._polygon_mode = "erase"
+            self._centerline_mode = None
+
+        imgui.separator()
+        imgui.text("Centerline Edit")
+
+        if imgui.button("Add CL Vertex"):
+            self._centerline_mode = "add"
+            self._polygon_mode = None
+
+        imgui.same_line()
+
+        if imgui.button("Erase CL Vertex"):
+            self._centerline_mode = "erase"
+            self._polygon_mode = None
 
         imgui.end()
 
@@ -597,6 +613,10 @@ class SceneUI:
 
     def consume_polygon_mode(self):
         mode = self._polygon_mode
+        return mode
+
+    def consume_centerline_mode(self):
+        mode = self._centerline_mode
         return mode
 
     def consume_reload_flag(self):
@@ -832,10 +852,18 @@ class Viz:
                     if not self._ui._live_topic_mode and self._ui.show_edit_polygon:
 
                         polygon_result = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos, ray_dir)
-                        if polygon_result is not None:
+                        cl_result      = self._hd_grid_acc._centerline_spheres.intersect_ray(cam_pos, ray_dir)
+                        poly_t = polygon_result[1] if polygon_result is not None else float("inf")
+                        cl_t   = cl_result[1]      if cl_result      is not None else float("inf")
+
+                        if polygon_result is not None and poly_t <= cl_t:
                             polygon_idx, _ = polygon_result
                             self._hd_grid_acc._polygon_spheres.select(polygon_idx)
                             self._hd_grid_acc._polygon_spheres.begin_drag(cam_pos, ray_dir)
+                        elif cl_result is not None:
+                            cl_idx, _ = cl_result
+                            self._hd_grid_acc._centerline_spheres.select(cl_idx)
+                            self._hd_grid_acc._centerline_spheres.begin_drag(cam_pos, ray_dir)
 
                 # -----------------------------
                 # LEFT RELEASE (click select OR finish drag)
@@ -895,6 +923,41 @@ class Viz:
                                     self._ui._polygon_mode = None
                                     handled_polygon_mode = True
 
+                            # --- Centerline add / erase ---
+                            if not handled_polygon_mode and self._ui.show_edit_polygon:
+                                centerline_mode = self._ui.consume_centerline_mode()
+
+                                if centerline_mode is not None:
+
+                                    if centerline_mode == "add":
+                                        if abs(ray_dir[2]) > 1e-6:
+                                            t = -cam_pos[2] / ray_dir[2]
+                                            hit = cam_pos + t * ray_dir
+                                        else:
+                                            hit = None
+                                        if hit is not None:
+                                            self._hd_grid_acc.add_vertex_to_centerline(hit)
+
+                                    elif centerline_mode == "erase":
+                                        self._hd_grid_acc.erase_selected_centerline_vertex()
+
+                                    self._hd_grid_acc.rebuild_centerline_spheres()
+                                    # recompute smooth line and left/right split
+                                    cl_smooth = self._hd_grid_acc.get_smooth_centerline()
+                                    if cl_smooth is not None:
+                                        self._path_center = cl_smooth
+                                    if self._polys and self._path_center is not None and len(self._path_center) >= 2:
+                                        left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
+                                            polygon_world=self._polys[0],
+                                            centerline_world=self._path_center
+                                        )
+                                        self._path_left, self._path_right = left, right
+                                    else:
+                                        self._path_left, self._path_right = None, None
+
+                                    self._ui._centerline_mode = None
+                                    handled_polygon_mode = True
+
                             if not handled_polygon_mode:
 
                                 # bring ray into lidar frame so label.intersect_ray works correctly
@@ -944,21 +1007,37 @@ class Viz:
                     if not self._ui._live_topic_mode:
                         drag_idx = self._hd_grid_acc._polygon_spheres._selected_index
                         was_dragging = self._hd_grid_acc._polygon_spheres._dragging
-
                         self._hd_grid_acc._polygon_spheres.end_drag()
 
+                        cl_drag_idx = self._hd_grid_acc._centerline_spheres._selected_index
+                        was_cl_dragging = self._hd_grid_acc._centerline_spheres._dragging
+                        self._hd_grid_acc._centerline_spheres.end_drag()
+
                         if self._ui.show_edit_polygon and was_dragging and drag_idx >= 0:
-                            # ensure final position is committed
                             self._hd_grid_acc.sync_sphere_to_polygon(drag_idx)
                             self._hd_grid_acc.rasterize_edited_polygons_to_grid()
                             rgba = self._hd_grid_acc.to_rgba(alpha_scale=220)
                             self._hd_grid_plane.set_texture_rgba(rgba)
-                            # refresh green polygon line and left/right path lines from current editable polygon
                             self._polys = self._hd_grid_acc.get_editable_polygons() or []
-                            if self._polys and self._pose.path_positions is not None and len(self._pose.path_positions) >= 2:
+                            centerline = self._path_center if self._path_center is not None and len(self._path_center) >= 2 else None
+                            if self._polys and centerline is not None:
                                 left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
                                     polygon_world=self._polys[0],
-                                    centerline_world=np.asarray(self._pose.path_positions, dtype=np.float32)
+                                    centerline_world=centerline
+                                )
+                                self._path_left, self._path_right = left, right
+                            else:
+                                self._path_left, self._path_right = None, None
+
+                        if self._ui.show_edit_polygon and was_cl_dragging and cl_drag_idx >= 0:
+                            self._hd_grid_acc.sync_centerline_sphere(cl_drag_idx)
+                            cl_smooth = self._hd_grid_acc.get_smooth_centerline()
+                            if cl_smooth is not None:
+                                self._path_center = cl_smooth
+                            if self._polys and self._path_center is not None and len(self._path_center) >= 2:
+                                left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
+                                    polygon_world=self._polys[0],
+                                    centerline_world=self._path_center
                                 )
                                 self._path_left, self._path_right = left, right
                             else:
@@ -971,7 +1050,7 @@ class Viz:
                 # -----------------------------
                 if left_pressed:
                     if self._hd_grid_acc._polygon_spheres._dragging and not self._ui._live_topic_mode and self._ui.show_edit_polygon:
-                        # Only compute ray while dragging a polygon sphere
+                        # Drag a polygon boundary sphere
                         inv_proj = np.linalg.inv(proj)
                         inv_view = np.linalg.inv(view)
                         cam_pos_world = inv_view[:3, 3]
@@ -985,12 +1064,39 @@ class Viz:
                         idx = self._hd_grid_acc._polygon_spheres._selected_index
                         if idx >= 0:
                             self._hd_grid_acc.sync_sphere_to_polygon(idx)
-                            # update green line and left/right path lines during drag
                             self._polys = self._hd_grid_acc.get_editable_polygons() or []
-                            if self._polys and self._pose.path_positions is not None and len(self._pose.path_positions) >= 2:
+                            centerline = self._path_center if self._path_center is not None and len(self._path_center) >= 2 else None
+                            if self._polys and centerline is not None:
                                 left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
                                     polygon_world=self._polys[0],
-                                    centerline_world=np.asarray(self._pose.path_positions, dtype=np.float32)
+                                    centerline_world=centerline
+                                )
+                                self._path_left, self._path_right = left, right
+                            else:
+                                self._path_left, self._path_right = None, None
+
+                    elif self._hd_grid_acc._centerline_spheres._dragging and not self._ui._live_topic_mode and self._ui.show_edit_polygon:
+                        # Drag a centerline sphere
+                        inv_proj = np.linalg.inv(proj)
+                        inv_view = np.linalg.inv(view)
+                        cam_pos_world = inv_view[:3, 3]
+
+                        cam_pos, ray_dir = self.screen_to_world_ray(
+                            x, y, width, height,
+                            inv_proj, inv_view, cam_pos_world
+                        )
+
+                        self._hd_grid_acc._centerline_spheres.drag(cam_pos, ray_dir)
+                        idx = self._hd_grid_acc._centerline_spheres._selected_index
+                        if idx >= 0:
+                            self._hd_grid_acc.sync_centerline_sphere(idx)
+                            cl_smooth = self._hd_grid_acc.get_smooth_centerline()
+                            if cl_smooth is not None:
+                                self._path_center = cl_smooth
+                            if self._polys and self._path_center is not None and len(self._path_center) >= 2:
+                                left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
+                                    polygon_world=self._polys[0],
+                                    centerline_world=self._path_center
                                 )
                                 self._path_left, self._path_right = left, right
                             else:
@@ -1031,6 +1137,11 @@ class Viz:
                         self._hd_grid_acc._polygon_spheres.end_drag()
                         self._hd_grid_acc._polygon_spheres.select(-1)
                         self._hd_grid_acc.clear_polygon_edits()
+                        self._hd_grid_acc._centerline_spheres.end_drag()
+                        self._hd_grid_acc._centerline_spheres.select(-1)
+                        self._hd_grid_acc._centerline_edited = False
+                        self._ui._polygon_mode = None
+                        self._ui._centerline_mode = None
 
                     if glfw.get_key(self._window, glfw.KEY_UP) == glfw.PRESS:
                         self._labels.move_selected_local(speed, 0, 0); moved = True
@@ -1136,14 +1247,18 @@ class Viz:
                             else:
                                 self._polys = self._hd_grid_acc.extract_polygons()
                                 self._hd_grid_acc.update_polygon_spheres(self._polys)
+                            # reset centerline spheres only if the user hasn't manually edited them
+                            if not self._hd_grid_acc._centerline_edited:
+                                self._hd_grid_acc.update_centerline_spheres(center)
+                            _cl_smooth = self._hd_grid_acc.get_smooth_centerline()
+                            self._path_center = _cl_smooth if _cl_smooth is not None else center
                             left, right = None, None
-                            if self._polys:
-                                poly = self._polys[0]  # assuming single drivable region
+                            if self._polys and len(self._path_center) >= 2:
+                                poly = self._polys[0]
                                 left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
                                     polygon_world=poly,
-                                    centerline_world=np.asarray(self._pose.path_positions, dtype=np.float32)
+                                    centerline_world=self._path_center
                                 )
-                            self._path_center = center
                             self._path_left = left
                             self._path_right = right
                         else:
@@ -1170,10 +1285,13 @@ class Viz:
                             center = center.reshape(-1, 2)
                         if center.shape[1] == 2:
                             center = np.concatenate([center, np.zeros((len(center), 1), dtype=np.float32)], axis=1)
-                        self._path_center = center
+                        if not self._hd_grid_acc._centerline_edited:
+                            self._hd_grid_acc.update_centerline_spheres(center)
+                        _cl_smooth = self._hd_grid_acc.get_smooth_centerline()
+                        self._path_center = _cl_smooth if _cl_smooth is not None else center
                         left, right = self._hd_grid_acc.split_polygon_left_right_from_centerline(
                             polygon_world=self._polys[0],
-                            centerline_world=np.asarray(self._pose.path_positions, dtype=np.float32)
+                            centerline_world=self._path_center
                         )
                         self._path_left, self._path_right = left, right
                     else:
@@ -1259,6 +1377,7 @@ class Viz:
                         glLineWidth(1.0)
 
                         self._hd_grid_acc.draw_polygon_spheres(view.T, proj.T)
+                        self._hd_grid_acc.draw_centerline_spheres(view.T, proj.T)
 
 
                     if self._path_center is not None and len(self._path_center) >= 2:
