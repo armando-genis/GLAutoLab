@@ -1,4 +1,5 @@
 vehicle_config:
+  model_file: "rot_sdv.glb"
   height: 1.86
   width: 1.48
   length: 3.88

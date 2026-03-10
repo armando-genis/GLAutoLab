@@ -1,0 +1,25 @@
+vehicle_config:
+  model_file: "rot_sdv.glb"
+  height: 1.86
+  width: 1.48
+  length: 3.88
+
+base_link_to_lidar:
+  R:
+    rows: 3
+    cols: 3
+    data: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+  t:
+    rows: 3
+    cols: 1
+    data: [0.0, 0.0, 1.2]
+
+center_link_to_base_link:
+  R:
+    rows: 3
+    cols: 3
+    data: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+  t:
+    rows: 3
+    cols: 1
+    data: [1.5, 0.0, 0.0]

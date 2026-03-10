@@ -12,407 +12,17 @@ import imgui
 from imgui.integrations.glfw import GlfwRenderer
 from PIL import Image
 
+from ModelsGBLModule import ModelUpload
+from shaderModules import create_shader_program, create_pointcloud_shader_program
 from dataLoaderModule import SyncDataset
 from labelManager import LabelManager, LabelCameraManager
 from poseManager import PoseManager
-from UlitysModule import Cube, draw_axes
+from UlitysModule import Cube, draw_axes, Grid, PointCloud, ArcCameraControl, ImageTexture, perspective, translate, scale, rotate_x, rotate_y, rotate_z
 from CameraLidarModule import CameraLidarModule
 from carModelModule import CarModel
 from ipmModule import IpmModule, TexturedPlane, HDMapBoundaryAccumulator, HDMapGridAccumulator
 from personDetectionModule import PersonDetectionModule
 from hdMapIO import HDMapIO, HDMapData, HDMapRenderer
-
-# ==============================
-# Shaders
-# ==============================
-
-VERTEX_SHADER = """
-#version 330 core
-layout(location = 0) in vec3 position;
-
-uniform mat4 model;
-uniform mat4 view;
-uniform mat4 projection;
-
-void main()
-{
-    gl_Position = projection * view * model * vec4(position, 1.0);
-    gl_PointSize = 2.0;
-}
-"""
-
-FRAGMENT_SHADER = """
-#version 330 core
-uniform vec4 material_color;
-out vec4 FragColor;
-void main()
-{
-    FragColor = material_color;
-}
-"""
-
-# Point cloud: per-vertex color (white-to-blue scale)
-VERTEX_SHADER_POINTS = """
-#version 330 core
-layout(location = 0) in vec3 position;
-layout(location = 1) in vec3 color;
-
-uniform mat4 model;
-uniform mat4 view;
-uniform mat4 projection;
-
-out vec3 vColor;
-
-void main()
-{
-    gl_Position = projection * view * model * vec4(position, 1.0);
-    gl_PointSize = 2.0;
-    vColor = color;
-}
-"""
-
-FRAGMENT_SHADER_POINTS = """
-#version 330 core
-in vec3 vColor;
-out vec4 FragColor;
-void main()
-{
-    FragColor = vec4(vColor, 1.0);
-}
-"""
-
-def _create_shader_program():
-    v = glCreateShader(GL_VERTEX_SHADER)
-    glShaderSource(v, VERTEX_SHADER)
-    glCompileShader(v)
-
-    f = glCreateShader(GL_FRAGMENT_SHADER)
-    glShaderSource(f, FRAGMENT_SHADER)
-    glCompileShader(f)
-
-    program = glCreateProgram()
-    glAttachShader(program, v)
-    glAttachShader(program, f)
-    glLinkProgram(program)
-
-    glDeleteShader(v)
-    glDeleteShader(f)
-    return program
-
-
-def _create_pointcloud_shader_program():
-    v = glCreateShader(GL_VERTEX_SHADER)
-    glShaderSource(v, VERTEX_SHADER_POINTS)
-    glCompileShader(v)
-
-    f = glCreateShader(GL_FRAGMENT_SHADER)
-    glShaderSource(f, FRAGMENT_SHADER_POINTS)
-    glCompileShader(f)
-
-    program = glCreateProgram()
-    glAttachShader(program, v)
-    glAttachShader(program, f)
-    glLinkProgram(program)
-
-    glDeleteShader(v)
-    glDeleteShader(f)
-    return program
-
-
-# Matrix utilities
-def perspective(fov_rad, aspect, near, far):
-    f = 1.0 / math.tan(fov_rad / 2.0)
-    M = np.zeros((4, 4), dtype=np.float32)
-    M[0, 0] = f / aspect
-    M[1, 1] = f
-    M[2, 2] = (far + near) / (near - far)
-    M[2, 3] = (2 * far * near) / (near - far)
-    M[3, 2] = -1
-    return M
-
-
-def look_at(eye, target, up):
-    f = target - eye
-    f = f / np.linalg.norm(f)
-    s = np.cross(f, up)
-    s = s / np.linalg.norm(s)
-    u = np.cross(s, f)
-    M = np.identity(4, dtype=np.float32)
-    M[0, :3] = s
-    M[1, :3] = u
-    M[2, :3] = -f
-    T = np.identity(4, dtype=np.float32)
-    T[:3, 3] = -eye
-    return M @ T
-
-
-def translate(x, y, z):
-    M = np.identity(4, dtype=np.float32)
-    M[0, 3] = x
-    M[1, 3] = y
-    M[2, 3] = z
-    return M
-
-
-def scale(sx, sy, sz):
-    M = np.identity(4, dtype=np.float32)
-    M[0, 0] = sx
-    M[1, 1] = sy
-    M[2, 2] = sz
-    return M
-
-# Cube
-# Grid
-class Grid:
-    """XY grid in the z=0 plane."""
-
-    def __init__(self, half_extent=5.0, step=1.0):
-        vertices = []
-        x = -half_extent
-        while x <= half_extent + 1e-9:
-            # vertical lines (parallel Y)
-            vertices.extend([x, -half_extent, 0.0])
-            vertices.extend([x,  half_extent, 0.0])
-            # horizontal lines (parallel X)
-            vertices.extend([-half_extent, x, 0.0])
-            vertices.extend([ half_extent, x, 0.0])
-            x += step
-
-        self._vertices = np.array(vertices, dtype=np.float32)
-        self._vertex_count = len(self._vertices) // 3
-
-        self._vao = glGenVertexArrays(1)
-        vbo = glGenBuffers(1)
-        glBindVertexArray(self._vao)
-        glBindBuffer(GL_ARRAY_BUFFER, vbo)
-        glBufferData(GL_ARRAY_BUFFER, self._vertices.nbytes, self._vertices, GL_STATIC_DRAW)
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, ctypes.c_void_p(0))
-        glEnableVertexAttribArray(0)
-        glBindVertexArray(0)
-
-    def draw(self):
-        """Draw the grid as lines. Set model matrix and material_color before calling."""
-        glBindVertexArray(self._vao)
-        glLineWidth(2.0)
-        glDrawArrays(GL_LINES, 0, self._vertex_count)
-
-
-# Point Cloud
-class PointCloud:
-    """Dynamic point cloud renderer (XYZ + per-point white-to-blue color)."""
-
-    def __init__(self, max_points=1_000_000):
-        self._max_points = max_points
-        self._count = 0
-
-        self._vao = glGenVertexArrays(1)
-        self._vbo = glGenBuffers(1)
-        self._cbo = glGenBuffers(1)
-
-        glBindVertexArray(self._vao)
-
-        glBindBuffer(GL_ARRAY_BUFFER, self._vbo)
-        glBufferData(
-            GL_ARRAY_BUFFER,
-            max_points * 3 * 4,  # 3 floats per point
-            None,
-            GL_DYNAMIC_DRAW
-        )
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * 4, ctypes.c_void_p(0))
-        glEnableVertexAttribArray(0)
-
-        glBindBuffer(GL_ARRAY_BUFFER, self._cbo)
-        glBufferData(
-            GL_ARRAY_BUFFER,
-            max_points * 3 * 4,  # 3 floats per color
-            None,
-            GL_DYNAMIC_DRAW
-        )
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 3 * 4, ctypes.c_void_p(0))
-        glEnableVertexAttribArray(1)
-
-        glBindVertexArray(0)
-
-    def update(self, xyz: np.ndarray):
-        """Upload Nx3 float32 array; colors are computed as white-to-blue by height (Z)."""
-        if xyz.dtype != np.float32:
-            xyz = xyz.astype(np.float32)
-
-        self._count = min(len(xyz), self._max_points)
-        xyz = xyz[:self._count]
-
-        # White-to-blue scale by Z (low Z = blue, high Z = white); visible on dark bg
-        z = xyz[:, 2]
-        z_min, z_max = float(np.min(z)), float(np.max(z))
-        if z_max > z_min:
-            t = (z - z_min) / (z_max - z_min)
-        else:
-            t = np.ones(self._count, dtype=np.float32) * 0.5
-        # (0.2, 0.2, 0.85) -> (1, 1, 1) so low = blue, high = white
-        r = np.float32(0.2) + t * np.float32(0.8)
-        g = np.float32(0.2) + t * np.float32(0.8)
-        b = np.float32(0.85) + t * np.float32(0.15)
-        colors = np.column_stack((r, g, b)).astype(np.float32)
-
-        glBindBuffer(GL_ARRAY_BUFFER, self._vbo)
-        glBufferSubData(GL_ARRAY_BUFFER, 0, xyz.nbytes, xyz)
-
-        glBindBuffer(GL_ARRAY_BUFFER, self._cbo)
-        glBufferSubData(GL_ARRAY_BUFFER, 0, colors.nbytes, colors)
-
-    def update_colored(self, xyz: np.ndarray, colors: np.ndarray):
-        """Upload Nx3 float32 positions and Nx3 uint8 RGB colors."""
-        if xyz.dtype != np.float32:
-            xyz = xyz.astype(np.float32)
-        colors_f = colors.astype(np.float32) / 255.0
-
-        self._count = min(len(xyz), self._max_points)
-        xyz = xyz[:self._count]
-        colors_f = colors_f[:self._count]
-
-        glBindBuffer(GL_ARRAY_BUFFER, self._vbo)
-        glBufferSubData(GL_ARRAY_BUFFER, 0, xyz.nbytes, xyz)
-
-        glBindBuffer(GL_ARRAY_BUFFER, self._cbo)
-        glBufferSubData(GL_ARRAY_BUFFER, 0, colors_f.nbytes, colors_f)
-
-    def draw(self):
-        glBindVertexArray(self._vao)
-        glDrawArrays(GL_POINTS, 0, self._count)
-
-class ArcCameraControl:
-    def __init__(self):
-        self.center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-        self.distance = 10.0
-
-        self.theta = 0.0
-        self.phi = -60.0 * math.pi / 180.0
-
-        self.left_button_down = False
-        self.middle_button_down = False
-
-        self.drag_last_pos = np.array([0, 0], dtype=np.int32)
-
-    # Mouse button
-    def mouse(self, pos, button, down):
-        if button == 0:
-            self.left_button_down = down
-        elif button == 2:
-            self.middle_button_down = down
-
-        self.drag_last_pos = np.array(pos, dtype=np.int32)
-
-    # Mouse drag
-    def drag(self, pos, button):
-        pos = np.array(pos, dtype=np.int32)
-        rel = pos - self.drag_last_pos
-
-        if button == 0:
-            # ORBIT
-            self.theta -= rel[0] * 0.01
-            self.phi   -= rel[1] * 0.01
-
-            # normalize theta [-pi, pi]
-            if self.theta > math.pi:
-                self.theta -= 2 * math.pi
-            if self.theta < -math.pi:
-                self.theta += 2 * math.pi
-
-            # clamp phi
-            self.phi = np.clip(self.phi,
-                               -math.pi/2 + 0.01,
-                               math.pi/2 - 0.01)
-
-        elif button == 2:
-            # PAN
-            rot = self._rotation_matrix()
-            right = rot @ np.array([0, 1, 0], dtype=np.float32)
-            up    = rot @ np.array([0, 0, 1], dtype=np.float32)
-
-            pan = (-rel[0] * right + rel[1] * up) * self.distance * 0.001
-            self.center += pan
-
-        self.drag_last_pos = pos
-
-    # Scroll
-    def scroll(self, rel_y):
-        if rel_y > 0:
-            self.distance *= 0.9
-        elif rel_y < 0:
-            self.distance *= 1.1
-
-        self.distance = max(0.1, self.distance)
-
-    # Rotation
-    def _rotation_matrix(self):
-        Rz = np.array([
-            [math.cos(self.theta), -math.sin(self.theta), 0],
-            [math.sin(self.theta),  math.cos(self.theta), 0],
-            [0, 0, 1]
-        ])
-
-        Ry = np.array([
-            [ math.cos(self.phi), 0, math.sin(self.phi)],
-            [0, 1, 0],
-            [-math.sin(self.phi), 0, math.cos(self.phi)]
-        ])
-
-        return Rz @ Ry
-
-    # View matrix
-    def view_matrix(self):
-        rot = self._rotation_matrix()
-
-        offset = rot @ np.array([self.distance, 0, 0], dtype=np.float32)
-        eye = self.center + offset
-
-        return look_at(eye, self.center, np.array([0, 0, 1], dtype=np.float32))
-
-
-# Image Texture
-class ImageTexture:
-    """Creates an OpenGL texture from a numpy RGB image."""
-
-    def __init__(self, image_rgb: np.ndarray):
-        assert image_rgb.dtype == np.uint8
-        assert image_rgb.ndim == 3
-
-        self.height, self.width = image_rgb.shape[:2]
-
-        self.texture_id = glGenTextures(1)
-        glBindTexture(GL_TEXTURE_2D, self.texture_id)
-
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-
-        glTexImage2D(
-            GL_TEXTURE_2D,
-            0,
-            GL_RGB,
-            self.width,
-            self.height,
-            0,
-            GL_RGB,
-            GL_UNSIGNED_BYTE,
-            image_rgb
-        )
-
-        glBindTexture(GL_TEXTURE_2D, 0)
-
-    def update(self, image_rgb: np.ndarray):
-        """Replace texture data (same dimensions) with a new RGB image."""
-        glBindTexture(GL_TEXTURE_2D, self.texture_id)
-        glTexSubImage2D(
-            GL_TEXTURE_2D, 0, 0, 0,
-            self.width, self.height,
-            GL_RGB, GL_UNSIGNED_BYTE,
-            np.ascontiguousarray(image_rgb, dtype=np.uint8),
-        )
-        glBindTexture(GL_TEXTURE_2D, 0)
-
-    def delete(self):
-        glDeleteTextures([self.texture_id])
-
 
 # ImGui
 class SceneUI:
@@ -428,6 +38,7 @@ class SceneUI:
         self.show_colored_points = False
         self.show_pose = False
         self.show_ipm = False
+        self.show_hdmap_texture = False  # show HD grid plane + all overlays on top of the IPM plane
         self.show_edit_polygon = False  # mapping complete: extract polygon + show spheres for editing
         self._needs_polygon_extract = False  # one-shot: extract when user checks show_edit_polygon
         self.show_hdmap_panel = False  # toggle the HD Map Settings floating window
@@ -460,6 +71,9 @@ class SceneUI:
         self._crosswalk_mode = None  # None | "add" | "erase"
         self.show_crosswalk = False
         self.crosswalk_width = 3.0   # metres
+
+        self._building_mode = None   # None | "add" | "erase"
+        self.show_buildings = False
 
         # HD-map persistence
         self._hdmap_save_path = "hdmap_export.json"
@@ -591,6 +205,10 @@ class SceneUI:
             if changed:
                 self._needs_reload = True
 
+            _, self.show_hdmap_texture = imgui.checkbox(
+                "Show HD Map Texture", self.show_hdmap_texture
+            )
+
             changed, self.show_edit_polygon = imgui.checkbox(
                 "Mapping complete - Edit polygon", self.show_edit_polygon
             )
@@ -657,6 +275,36 @@ class SceneUI:
 
             if imgui.button("Clear All BL"):
                 self._bike_lane_mode = "clear_all"
+
+            # ── Buildings ───────────────────────────────────────────────────
+            imgui.separator()
+            imgui.text("Buildings")
+
+            _, self.show_buildings = imgui.checkbox("Show Buildings", self.show_buildings)
+
+            if imgui.button("Add Bld Vertex"):
+                self._building_mode = "add"
+                self._polygon_mode = None
+                self._centerline_mode = None
+                self._bike_lane_mode = None
+                self._crosswalk_mode = None
+
+            imgui.same_line()
+
+            if imgui.button("Erase Bld Vertex"):
+                self._building_mode = "erase"
+                self._polygon_mode = None
+                self._centerline_mode = None
+                self._bike_lane_mode = None
+                self._crosswalk_mode = None
+
+            if imgui.button("Store Building"):
+                self._building_mode = "store"
+
+            imgui.same_line()
+
+            if imgui.button("Clear All Bld"):
+                self._building_mode = "clear_all"
 
             # ── Crosswalk ───────────────────────────────────────────────────
             imgui.separator()
@@ -788,8 +436,8 @@ class Viz:
         glfw.swap_interval(1)
         glEnable(GL_DEPTH_TEST)
 
-        self._program = _create_shader_program()
-        self._program_points = _create_pointcloud_shader_program()
+        self._program = create_shader_program()
+        self._program_points = create_pointcloud_shader_program()
         self._model_loc = glGetUniformLocation(self._program, "model")
         self._color_loc = glGetUniformLocation(self._program, "material_color")
         self._model_loc_points = glGetUniformLocation(self._program_points, "model")
@@ -861,6 +509,8 @@ class Viz:
             bl_width=self._ui.bike_lane_width,
         )
 
+        self._hd_map_renderer.load_bike_lane_icon(icons)
+
         # Bike-lane visuals (orange centre + left/right boundaries)
         self._bike_lane_center = None          # active segment smooth curve
         self._bike_lane_left = None
@@ -869,11 +519,17 @@ class Viz:
         self._bike_lane_stored: list = []
         self._bike_lane_width_prev = self._ui.bike_lane_width
 
+        # Building polygon visuals (smooth closed curves)
+        self._bld_active_smooth = None         # active building smooth polygon
+        self._bld_stored_smooth: list = []     # list of smooth np.ndarray per stored building
+
         self._lidar_model = np.identity(4, dtype=np.float32)
         self._basefootprint_model = np.identity(4, dtype=np.float32)
         self.model_ipm_plane = np.identity(4, dtype=np.float32)
+        self.model_floor_plane = np.identity(4, dtype=np.float32)
         self._car_model = CarModel(dataset.car_settings)
-
+        self.model_floor_plane = self._car_model.get_basefootprint_frame(self._lidar_model)
+        
         self._mouse_pressed = False
         self._mouse_press_pos = None
         self._click_threshold = 5  # pixels
@@ -885,10 +541,25 @@ class Viz:
         self._person_detection_module = PersonDetectionModule()
         self._person_detection_module.load_camera_lidar_parameters(dataset)
 
+        self._model_upload = ModelUpload()
+        self._glb_shader = self._model_upload.create_glb_shader()
+        self.mesh = self._model_upload.load_glb(dataset.car_model_file)
+        
+
     def _set_model_color(self, model_matrix, r, g, b, a=1.0):
         glUseProgram(self._program)
         glUniformMatrix4fv(self._model_loc, 1, GL_FALSE, model_matrix.T)
         glUniform4f(self._color_loc, r, g, b, a)
+
+    def _ray_to_model_space(self, cam_pos, ray_dir, model):
+        """Transform a world-space ray into the local space of *model*."""
+        inv_m = np.linalg.inv(model)
+        cam_m = (inv_m @ np.append(cam_pos, 1.0))[:3]
+        dir_m = (inv_m @ np.append(ray_dir, 0.0))[:3]
+        n = np.linalg.norm(dir_m)
+        if n > 1e-8:
+            dir_m /= n
+        return cam_m, dir_m
 
     @staticmethod
     def _pose_to_matrix(location, heading, roll, pitch) -> np.ndarray:
@@ -951,6 +622,24 @@ class Viz:
                 left = right = None
             self._bike_lane_stored.append((smooth, left, right))
 
+    def _refresh_buildings(self):
+        """Recompute smooth closed curves for the active building and all stored ones."""
+        acc = self._hd_grid_acc
+
+        # Active building polygon
+        if acc._bld_pts is not None and len(acc._bld_pts) >= 3:
+            self._bld_active_smooth = acc.get_smooth_building()
+        else:
+            self._bld_active_smooth = acc._bld_pts  # raw (may be 1-2 pts)
+
+        # Stored buildings
+        self._bld_stored_smooth = []
+        for seg_pts in acc._bld_segments:
+            if len(seg_pts) < 3:
+                continue
+            smooth = acc._interpolate_closed_curve(seg_pts)
+            self._bld_stored_smooth.append(smooth)
+
     # ------------------------------------------------------------------
     # HD-map persistence helpers
     # ------------------------------------------------------------------
@@ -966,6 +655,8 @@ class Viz:
             bike_lane_width=float(self._ui.bike_lane_width),
             crosswalks=[c.copy() for c in acc._crosswalk_pts],
             crosswalk_width=float(self._ui.crosswalk_width),
+            buildings=[s.copy() for s in acc._bld_segments] +
+                      ([acc._bld_pts.copy()] if acc._bld_pts is not None and len(acc._bld_pts) >= 3 else []),
         )
 
     def _apply_hdmap_data(self, data: HDMapData) -> None:
@@ -1035,6 +726,17 @@ class Viz:
         if acc._crosswalk_pts:
             self._ui.show_crosswalk = True
 
+        # ── Buildings ────────────────────────────────────────────────────
+        acc._bld_segments = [
+            b.copy() for b in data.buildings
+            if b is not None and len(b) >= 3
+        ]
+        acc._bld_pts = None
+        acc._bld_spheres.build_from_positions_direct([])
+        self._refresh_buildings()
+        if acc._bld_segments:
+            self._ui.show_buildings = True
+
         # Make sure the HD-map panel is visible so the user sees what loaded
         self._ui.show_hdmap_panel = True
 
@@ -1052,6 +754,33 @@ class Viz:
         ray_world /= np.linalg.norm(ray_world)
 
         return cam_pos, ray_world
+
+    def _draw_ipm_layers(self, view: np.ndarray, proj: np.ndarray) -> None:
+        self._hd_grid_acc.draw_all_layers(
+            view, proj,
+            program=self._program,
+            set_model_color=self._set_model_color,
+            model_ipm_plane=self.model_ipm_plane,
+            model_floor_plane=self.model_floor_plane,
+            ipm_plane=self._ipm_plane,
+            hd_grid_plane=self._hd_grid_plane,
+            hd_boundary_accumulator=self._hd_boundary_accumulator,
+            polys=self._polys,
+            path_center=self._path_center,
+            path_left=self._path_left,
+            path_right=self._path_right,
+            bld_active_smooth=self._bld_active_smooth,
+            bld_stored_smooth=self._bld_stored_smooth,
+            bike_lane_center=self._bike_lane_center,
+            bike_lane_left=self._bike_lane_left,
+            bike_lane_right=self._bike_lane_right,
+            bike_lane_stored=self._bike_lane_stored,
+            show_ipm=self._ui.show_ipm,
+            show_hdmap_texture=self._ui.show_hdmap_texture,
+            show_bike_lane=self._ui.show_bike_lane,
+            show_buildings=self._ui.show_buildings,
+            show_crosswalk=self._ui.show_crosswalk,
+        )
 
     def run(self):
         """Main render loop."""
@@ -1105,6 +834,17 @@ class Viz:
                 self._refresh_bike_lane()
                 self._ui._bike_lane_mode = None
 
+            # Handle immediate building button actions (store / clear all)
+            bld_mode = self._ui._building_mode
+            if bld_mode == "store":
+                self._hd_grid_acc.store_building_segment()
+                self._refresh_buildings()
+                self._ui._building_mode = None
+            elif bld_mode == "clear_all":
+                self._hd_grid_acc.clear_all_buildings()
+                self._refresh_buildings()
+                self._ui._building_mode = None
+
             # Handle crosswalk width slider changes
             if self._ui.show_crosswalk and self._ui.crosswalk_width != self._hd_grid_acc._crosswalk_width:
                 self._hd_grid_acc._crosswalk_width = self._ui.crosswalk_width
@@ -1128,6 +868,10 @@ class Viz:
                     )
                     self._ui._hdmap_status = f"Saved  ({HDMapIO.summary(data)})"
                 except Exception as exc:
+                    # HDMapRenderer.update() may have left the GL program unbound
+                    # if it raised mid-execution; restore it so the render loop
+                    # can continue without GL_INVALID_OPERATION errors.
+                    glUseProgram(self._program)
                     self._ui._hdmap_status = f"Save error: {exc}"
 
             if self._ui._hdmap_load_requested:
@@ -1143,6 +887,7 @@ class Viz:
                     self._ui.show_hdmap_render = True   # auto-show after load
                     self._ui._hdmap_status = f"Loaded  ({HDMapIO.summary(data)})"
                 except Exception as exc:
+                    glUseProgram(self._program)
                     self._ui._hdmap_status = f"Load error: {exc}"
 
             # --------------------------------------------------
@@ -1178,36 +923,46 @@ class Viz:
                         best_kind = None
                         best_idx  = -1
 
+                        cam_pos_m, ray_dir_m = self._ray_to_model_space(cam_pos, ray_dir, self.model_floor_plane)
+
                         if self._ui.show_edit_polygon:
-                            poly_res = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos, ray_dir)
-                            cl_res   = self._hd_grid_acc._centerline_spheres.intersect_ray(cam_pos, ray_dir)
+                            poly_res = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos_m, ray_dir_m)
+                            cl_res   = self._hd_grid_acc._centerline_spheres.intersect_ray(cam_pos_m, ray_dir_m)
                             if poly_res is not None and poly_res[1] < best_t:
                                 best_t = poly_res[1]; best_kind = "polygon"; best_idx = poly_res[0]
                             if cl_res is not None and cl_res[1] < best_t:
                                 best_t = cl_res[1]; best_kind = "centerline"; best_idx = cl_res[0]
 
                         if self._ui.show_bike_lane:
-                            bl_res = self._hd_grid_acc._bike_lane_spheres.intersect_ray(cam_pos, ray_dir)
+                            bl_res = self._hd_grid_acc._bike_lane_spheres.intersect_ray(cam_pos_m, ray_dir_m)
                             if bl_res is not None and bl_res[1] < best_t:
                                 best_t = bl_res[1]; best_kind = "bike_lane"; best_idx = bl_res[0]
 
                         if self._ui.show_crosswalk:
-                            cw_res = self._hd_grid_acc._crosswalk_spheres.intersect_ray(cam_pos, ray_dir)
+                            cw_res = self._hd_grid_acc._crosswalk_spheres.intersect_ray(cam_pos_m, ray_dir_m)
                             if cw_res is not None and cw_res[1] < best_t:
                                 best_t = cw_res[1]; best_kind = "crosswalk"; best_idx = cw_res[0]
 
+                        if self._ui.show_buildings:
+                            bld_res = self._hd_grid_acc._bld_spheres.intersect_ray(cam_pos_m, ray_dir_m)
+                            if bld_res is not None and bld_res[1] < best_t:
+                                best_t = bld_res[1]; best_kind = "building"; best_idx = bld_res[0]
+
                         if best_kind == "polygon":
                             self._hd_grid_acc._polygon_spheres.select(best_idx)
-                            self._hd_grid_acc._polygon_spheres.begin_drag(cam_pos, ray_dir)
+                            self._hd_grid_acc._polygon_spheres.begin_drag(cam_pos_m, ray_dir_m)
                         elif best_kind == "centerline":
                             self._hd_grid_acc._centerline_spheres.select(best_idx)
-                            self._hd_grid_acc._centerline_spheres.begin_drag(cam_pos, ray_dir)
+                            self._hd_grid_acc._centerline_spheres.begin_drag(cam_pos_m, ray_dir_m)
                         elif best_kind == "bike_lane":
                             self._hd_grid_acc._bike_lane_spheres.select(best_idx)
-                            self._hd_grid_acc._bike_lane_spheres.begin_drag(cam_pos, ray_dir)
+                            self._hd_grid_acc._bike_lane_spheres.begin_drag(cam_pos_m, ray_dir_m)
                         elif best_kind == "crosswalk":
                             self._hd_grid_acc._crosswalk_spheres.select(best_idx)
-                            self._hd_grid_acc._crosswalk_spheres.begin_drag(cam_pos, ray_dir)
+                            self._hd_grid_acc._crosswalk_spheres.begin_drag(cam_pos_m, ray_dir_m)
+                        elif best_kind == "building":
+                            self._hd_grid_acc._bld_spheres.select(best_idx)
+                            self._hd_grid_acc._bld_spheres.begin_drag(cam_pos_m, ray_dir_m)
 
                 # -----------------------------
                 # LEFT RELEASE (click select OR finish drag)
@@ -1323,6 +1078,26 @@ class Viz:
                                     self._ui._bike_lane_mode = None
                                     handled_polygon_mode = True
 
+                                # Building add / erase
+                                bld_mode_click = self._ui._building_mode
+                                if bld_mode_click in ("add", "erase") and self._ui.show_buildings:
+                                    if bld_mode_click == "add":
+                                        if abs(ray_dir[2]) > 1e-6:
+                                            t_gnd = -cam_pos[2] / ray_dir[2]
+                                            hit = cam_pos + t_gnd * ray_dir
+                                        else:
+                                            hit = None
+                                        if hit is not None:
+                                            self._hd_grid_acc.add_vertex_to_building(hit)
+
+                                    elif bld_mode_click == "erase":
+                                        self._hd_grid_acc.erase_selected_building_vertex()
+
+                                    self._hd_grid_acc.rebuild_building_spheres()
+                                    self._refresh_buildings()
+                                    self._ui._building_mode = None
+                                    handled_polygon_mode = True
+
                                 # Crosswalk add / erase
                                 cw_mode = self._ui._crosswalk_mode
                                 if cw_mode is not None and self._ui.show_crosswalk and cw_mode in ("add", "erase"):
@@ -1339,7 +1114,8 @@ class Viz:
                                             # else: keep "add" mode — waiting for second click
 
                                     elif cw_mode == "erase":
-                                        cw_res = self._hd_grid_acc._crosswalk_spheres.intersect_ray(cam_pos, ray_dir)
+                                        cam_pos_m, ray_dir_m = self._ray_to_model_space(cam_pos, ray_dir, self.model_floor_plane)
+                                        cw_res = self._hd_grid_acc._crosswalk_spheres.intersect_ray(cam_pos_m, ray_dir_m)
                                         if cw_res is not None:
                                             self._hd_grid_acc._crosswalk_spheres.select(cw_res[0])
                                             self._hd_grid_acc.erase_selected_crosswalk()
@@ -1366,16 +1142,10 @@ class Viz:
                                         min_label_t = t
                                         closest_label = i
 
-                                # pose sphere pick (world ray)
-                                sphere_result = self._pose._marker_renderer.intersect_ray(cam_pos, ray_dir)
-                                if sphere_result is not None:
-                                    sphere_idx, sphere_t = sphere_result
-                                else:
-                                    sphere_idx, sphere_t = None, float("inf")
-
-                                # polygon sphere pick (world ray) — only when edit-polygon mode
+                                # polygon sphere pick — only when edit-polygon mode
                                 if self._ui.show_edit_polygon:
-                                    polygon_result = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos, ray_dir)
+                                    cam_pos_m, ray_dir_m = self._ray_to_model_space(cam_pos, ray_dir, self.model_floor_plane)
+                                    polygon_result = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos_m, ray_dir_m)
                                     if polygon_result is not None:
                                         polygon_idx, polygon_t = polygon_result
                                     else:
@@ -1383,10 +1153,8 @@ class Viz:
                                 else:
                                     polygon_idx, polygon_t = None, float("inf")
 
-                                # selection priority (same as your logic)
-                                if sphere_idx is not None and sphere_t < min_label_t and sphere_t < polygon_t:
-                                    self._pose._marker_renderer.select(sphere_idx)
-                                elif polygon_idx is not None and polygon_t < min_label_t and polygon_t < sphere_t:
+                                # selection priority
+                                if polygon_idx is not None and polygon_t < min_label_t:
                                     self._hd_grid_acc._polygon_spheres.select(polygon_idx)
                                 elif closest_label is not None:
                                     self._labels.select(closest_label)
@@ -1409,6 +1177,10 @@ class Viz:
                         cw_drag_idx = self._hd_grid_acc._crosswalk_spheres._selected_index
                         was_cw_dragging = self._hd_grid_acc._crosswalk_spheres._dragging
                         self._hd_grid_acc._crosswalk_spheres.end_drag()
+
+                        bld_drag_idx = self._hd_grid_acc._bld_spheres._selected_index
+                        was_bld_dragging = self._hd_grid_acc._bld_spheres._dragging
+                        self._hd_grid_acc._bld_spheres.end_drag()
 
                         if self._ui.show_edit_polygon and was_dragging and drag_idx >= 0:
                             self._hd_grid_acc.sync_sphere_to_polygon(drag_idx)
@@ -1448,6 +1220,10 @@ class Viz:
                         if self._ui.show_crosswalk and was_cw_dragging and cw_drag_idx >= 0:
                             self._hd_grid_acc.sync_crosswalk_sphere(cw_drag_idx)
 
+                        if self._ui.show_buildings and was_bld_dragging and bld_drag_idx >= 0:
+                            self._hd_grid_acc.sync_building_sphere(bld_drag_idx)
+                            self._refresh_buildings()
+
                     self._mouse_pressed = False
 
                 # -----------------------------
@@ -1464,8 +1240,9 @@ class Viz:
                             x, y, width, height,
                             inv_proj, inv_view, cam_pos_world
                         )
+                        cam_pos_m, ray_dir_m = self._ray_to_model_space(cam_pos, ray_dir, self.model_floor_plane)
 
-                        self._hd_grid_acc._polygon_spheres.drag(cam_pos, ray_dir)
+                        self._hd_grid_acc._polygon_spheres.drag(cam_pos_m, ray_dir_m)
                         idx = self._hd_grid_acc._polygon_spheres._selected_index
                         if idx >= 0:
                             self._hd_grid_acc.sync_sphere_to_polygon(idx)
@@ -1490,8 +1267,9 @@ class Viz:
                             x, y, width, height,
                             inv_proj, inv_view, cam_pos_world
                         )
+                        cam_pos_m, ray_dir_m = self._ray_to_model_space(cam_pos, ray_dir, self.model_floor_plane)
 
-                        self._hd_grid_acc._centerline_spheres.drag(cam_pos, ray_dir)
+                        self._hd_grid_acc._centerline_spheres.drag(cam_pos_m, ray_dir_m)
                         idx = self._hd_grid_acc._centerline_spheres._selected_index
                         if idx >= 0:
                             self._hd_grid_acc.sync_centerline_sphere(idx)
@@ -1518,8 +1296,9 @@ class Viz:
                             x, y, width, height,
                             inv_proj, inv_view, cam_pos_world
                         )
+                        cam_pos_m, ray_dir_m = self._ray_to_model_space(cam_pos, ray_dir, self.model_floor_plane)
 
-                        self._hd_grid_acc._bike_lane_spheres.drag(cam_pos, ray_dir)
+                        self._hd_grid_acc._bike_lane_spheres.drag(cam_pos_m, ray_dir_m)
                         idx = self._hd_grid_acc._bike_lane_spheres._selected_index
                         if idx >= 0:
                             self._hd_grid_acc.sync_bike_lane_sphere(idx)
@@ -1535,11 +1314,30 @@ class Viz:
                             x, y, width, height,
                             inv_proj, inv_view, cam_pos_world
                         )
+                        cam_pos_m, ray_dir_m = self._ray_to_model_space(cam_pos, ray_dir, self.model_floor_plane)
 
-                        self._hd_grid_acc._crosswalk_spheres.drag(cam_pos, ray_dir)
+                        self._hd_grid_acc._crosswalk_spheres.drag(cam_pos_m, ray_dir_m)
                         idx = self._hd_grid_acc._crosswalk_spheres._selected_index
                         if idx >= 0:
                             self._hd_grid_acc.sync_crosswalk_sphere(idx)
+
+                    elif self._hd_grid_acc._bld_spheres._dragging and not self._ui._live_topic_mode and self._ui.show_buildings:
+                        # Drag a building polygon sphere
+                        inv_proj = np.linalg.inv(proj)
+                        inv_view = np.linalg.inv(view)
+                        cam_pos_world = inv_view[:3, 3]
+
+                        cam_pos, ray_dir = self.screen_to_world_ray(
+                            x, y, width, height,
+                            inv_proj, inv_view, cam_pos_world
+                        )
+                        cam_pos_m, ray_dir_m = self._ray_to_model_space(cam_pos, ray_dir, self.model_floor_plane)
+
+                        self._hd_grid_acc._bld_spheres.drag(cam_pos_m, ray_dir_m)
+                        idx = self._hd_grid_acc._bld_spheres._selected_index
+                        if idx >= 0:
+                            self._hd_grid_acc.sync_building_sphere(idx)
+                            self._refresh_buildings()
 
                     else:
                         # Pure camera movement (NO ray math)
@@ -1592,6 +1390,11 @@ class Viz:
                         self._hd_grid_acc._crosswalk_pending = None
                         self._hd_grid_acc._rebuild_cw_spheres(include_pending=False)
                         self._ui._crosswalk_mode = None
+
+                    if self._ui.show_buildings and glfw.get_key(self._window, glfw.KEY_ESCAPE) == glfw.PRESS:
+                        self._hd_grid_acc._bld_spheres.end_drag()
+                        self._hd_grid_acc._bld_spheres.select(-1)
+                        self._ui._building_mode = None
 
                     if glfw.get_key(self._window, glfw.KEY_UP) == glfw.PRESS:
                         self._labels.move_selected_local(speed, 0, 0); moved = True
@@ -1668,7 +1471,7 @@ class Viz:
 
                     self.model_ipm_plane = self._basefootprint_model @ scale(self.meters_x, self.meters_y, 1.0)
 
-                    bev, valid_mask, bev_drivable = self._ipm_module.warp_images(self._current_raw_images, self._current_images_mask)
+                    bev, valid_mask, bev_drivable = self._ipm_module.warp_images(self._current_images, self._current_images_mask)
 
                     self._ipm_plane.set_texture(bev, valid_mask)
 
@@ -1787,137 +1590,12 @@ class Viz:
                     self._set_model_color(grid_model, 0.25, 0.25, 0.25, 1.0)
                     self._grid.draw()
 
-                # draw the IPM plane based on the base footprint frame
-                if self._ui.show_ipm and self._ipm_plane.has_texture:
-
-                    self._ipm_plane.draw(view.T, proj.T, self.model_ipm_plane.T)
-                    if self._hd_boundary_accumulator.get_polygons() is not None:
-                        glUseProgram(self._program)
-                        self._set_model_color(identity, 1.0, 1.0, 1.0, 1.0)  # white; change r,g,b to change color
-                        glLineWidth(4.0)
-                        for poly in self._hd_boundary_accumulator.get_polygons():
-                            glBegin(GL_LINE_LOOP)
-                            for p in poly:
-                                glVertex3f(p[0], p[1], p[2] + 0.2)  # small lift above plane
-                            glEnd()
-                        glLineWidth(1.0)
-
-                if self._ui.show_ipm and self._hd_grid_plane.has_texture:
-
-                    grid_model = translate(
-                        self._hd_grid_acc.origin_x + self._hd_grid_acc.size_x / 2.0,
-                        self._hd_grid_acc.origin_y + self._hd_grid_acc.size_y / 2.0,
-                        0.01
-                    ) @ scale(
-                        self._hd_grid_acc.size_x,
-                        self._hd_grid_acc.size_y,
-                        1.0
-                    )
-
-                    self._hd_grid_plane.draw(view.T, proj.T, grid_model.T)
-
-                    if self._polys:
-                        glUseProgram(self._program)
-                        self._set_model_color(identity, 0.0, 1.0, 0.0, 1.0)
-                        glLineWidth(4.0)
-
-                        for poly in self._polys:
-                            glBegin(GL_LINE_LOOP)
-                            for p in poly:
-                                glVertex3f(p[0], p[1], p[2] + 0.05)
-                            glEnd()
-
-                        glLineWidth(1.0)
-
-                        self._hd_grid_acc.draw_polygon_spheres(view.T, proj.T)
-                        self._hd_grid_acc.draw_centerline_spheres(view.T, proj.T)
-                        # Centerline ribbon (purple)
-                        self._hd_grid_acc.draw_cl_ribbon(view.T, proj.T)
-
-                    # Bike-lane spheres + green ribbons
-                    if self._ui.show_bike_lane:
-                        self._hd_grid_acc.draw_bike_lane_spheres(view.T, proj.T)
-                        self._hd_grid_acc.draw_bl_ribbons(view.T, proj.T)
-
-                    # Crosswalk rectangles (white) + spheres
-                    if self._ui.show_crosswalk:
-                        corners_list = self._hd_grid_acc.get_crosswalk_corners()
-                        if corners_list:
-                            glUseProgram(self._program)
-                            self._set_model_color(identity, 1.0, 1.0, 1.0, 1.0)
-                            glLineWidth(3.0)
-                            for corners in corners_list:
-                                glBegin(GL_LINE_LOOP)
-                                for c in corners:
-                                    glVertex3f(float(c[0]), float(c[1]), float(c[2]) + 0.07)
-                                glEnd()
-                            glLineWidth(1.0)
-                        self._hd_grid_acc.draw_crosswalk_spheres(view.T, proj.T)
-                        glUseProgram(self._program)
-
-                    if self._path_center is not None and len(self._path_center) >= 2:
-                        z_lift = 0.05
-                        glUseProgram(self._program)
-                        glLineWidth(3.0)
-                        center, left, right = self._path_center, self._path_left, self._path_right
-                        # centerline: yellow
-                        self._set_model_color(identity, 1.0, 1.0, 0.0, 1.0)
-                        glBegin(GL_LINE_STRIP)
-                        for p in center:
-                            glVertex3f(p[0], p[1], p[2] + z_lift)
-                        glEnd()
-                        if left is not None:
-                            self._set_model_color(identity, 0.0, 1.0, 1.0, 1.0)
-                            glBegin(GL_LINE_STRIP)
-                            for p in left:
-                                glVertex3f(p[0], p[1], p[2] + z_lift)
-                            glEnd()
-                        if right is not None:
-                            self._set_model_color(identity, 1.0, 0.0, 1.0, 1.0)
-                            glBegin(GL_LINE_STRIP)
-                            for p in right:
-                                glVertex3f(p[0], p[1], p[2] + z_lift)
-                            glEnd()
-                        glLineWidth(1.0)
-
-                    # Bike-lane lines (orange centre + light/dark orange boundaries)
-                    if self._ui.show_bike_lane:
-                        z_lift = 0.06
-                        glUseProgram(self._program)
-                        glLineWidth(3.0)
-
-                        def _draw_bl_curve(center, left, right):
-                            if center is not None and len(center) >= 2:
-                                self._set_model_color(identity, 1.0, 0.55, 0.0, 1.0)  # orange centre
-                                glBegin(GL_LINE_STRIP)
-                                for p in center:
-                                    glVertex3f(p[0], p[1], p[2] + z_lift)
-                                glEnd()
-                            if left is not None:
-                                self._set_model_color(identity, 1.0, 0.82, 0.4, 1.0)  # light orange
-                                glBegin(GL_LINE_STRIP)
-                                for p in left:
-                                    glVertex3f(p[0], p[1], p[2] + z_lift)
-                                glEnd()
-                            if right is not None:
-                                self._set_model_color(identity, 0.80, 0.35, 0.0, 1.0)  # dark orange
-                                glBegin(GL_LINE_STRIP)
-                                for p in right:
-                                    glVertex3f(p[0], p[1], p[2] + z_lift)
-                                glEnd()
-
-                        # Active segment
-                        _draw_bl_curve(self._bike_lane_center, self._bike_lane_left, self._bike_lane_right)
-
-                        # All stored segments
-                        for (sc, sl, sr) in self._bike_lane_stored:
-                            _draw_bl_curve(sc, sl, sr)
-
-                        glLineWidth(1.0)
+                # IPM plane + HD grid overlays
+                self._draw_ipm_layers(view, proj)
 
                 # Loaded HD-map snapshot — independent of IPM / grid texture
                 if self._ui.show_hdmap_render:
-                    self._hd_map_renderer.draw(view.T, proj.T)
+                    self._hd_map_renderer.draw(view.T, proj.T, model=self.model_floor_plane.T)
                     glUseProgram(self._program)  # restore main program after renderer
 
                 # Point Cloud: transformed to world space via ego-pose; labels stay at lidar origin
@@ -1972,6 +1650,21 @@ class Viz:
                     self._labels.remove_selected()
                     self._labels_dirty = True
 
+                prev = glGetIntegerv(GL_CURRENT_PROGRAM)
+
+                glUseProgram(self._glb_shader)
+
+                self._model_upload.view_matrix = view.T
+                self._model_upload.proj_matrix = proj.T
+
+                model_transform = self._basefootprint_model @ rotate_x(-math.pi/2)
+
+                self.mesh.local_transform = model_transform.T
+
+                self._model_upload.render_glb_mesh(self.mesh, self._glb_shader)
+
+                glUseProgram(prev)
+
             else:
                 # Draw UI
                 self._ui.draw()
@@ -1995,7 +1688,6 @@ class Viz:
                     self._set_model_color(grid_model, 0.25, 0.25, 0.25, 1.0)
                     self._grid.draw()
 
-                
 
             # Render ImGui ON TOP
             imgui.render()
@@ -2009,7 +1701,7 @@ class Viz:
 
 if __name__ == "__main__":
 
-    dataset = SyncDataset(Path("../dataset-sdv-feb23"))
+    dataset = SyncDataset(Path("../dataset-sdv-feb28"))
     total = dataset.num_scenes()
     print(f"Total scenes: {total}")
 
@@ -2018,6 +1710,7 @@ if __name__ == "__main__":
         "person": Image.open("icons/person.png"),
         "bicycle": Image.open("icons/bike.png"),
         "bus": Image.open("icons/bus.png"),
+        "bicycle_lane": Image.open("icons/bike_lane.png"),
     }
 
     config_dir = Path("camera_configs")

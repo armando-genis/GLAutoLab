@@ -80,12 +80,14 @@ class IpmCameraConfig:
     self.K[2, 2] = 1.0
 
   def setR(self, y, p, r):
-
+    # Intrinsic ZYX: body rotation = Rz(yaw)·Ry(pitch)·Rx(roll)
+    # Inverse (vehicle → body) = Rx(-roll)·Ry(-pitch)·Rz(-yaw)
+    # Rs converts vehicle axes → OpenCV camera axes
     Rz = np.array([[np.cos(-y), -np.sin(-y), 0.0], [np.sin(-y), np.cos(-y), 0.0], [0.0, 0.0, 1.0]])
     Ry = np.array([[np.cos(-p), 0.0, np.sin(-p)], [0.0, 1.0, 0.0], [-np.sin(-p), 0.0, np.cos(-p)]])
     Rx = np.array([[1.0, 0.0, 0.0], [0.0, np.cos(-r), -np.sin(-r)], [0.0, np.sin(-r), np.cos(-r)]])
-    Rs = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]]) # switch axes (x = -y, y = -z, z = x)
-    self.R = Rs.dot(Rz.dot(Ry.dot(Rx)))
+    Rs = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]])
+    self.R = Rs.dot(Rx.dot(Ry.dot(Rz)))
 
   def setT(self, XCam, YCam, ZCam):
     X = np.array([XCam, YCam, ZCam])

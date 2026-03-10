@@ -10,6 +10,7 @@ _LINE_VERTEX_SHADER = """
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec2 aTex;
 
+uniform mat4 model;
 uniform mat4 view;
 uniform mat4 projection;
 
@@ -17,7 +18,7 @@ out vec2 TexCoord;
 
 void main() {
     TexCoord = aTex;
-    gl_Position = projection * view * vec4(aPos, 1.0);
+    gl_Position = projection * view * model * vec4(aPos, 1.0);
 }
 """
 
@@ -27,14 +28,29 @@ _LINE_FRAGMENT_SHADER = """
 in vec2 TexCoord;
 out vec4 FragColor;
 
-uniform vec4 u_color;
+uniform vec4  u_color;
+uniform int   u_flat;           // 0 = hollow  (edges solid, centre transparent)
+                                // 1 = flat     (uniform solid colour + alpha)
+                                // 2 = outlined (flat centre + grey edge strips)
+uniform float u_edge_fraction;  // [0..0.5] fraction of ribbon width used for edge strips (mode 2)
 
 void main() {
+    if (u_flat == 1) {
+        FragColor = vec4(u_color.rgb, u_color.a);
 
-    float distance_from_center = abs(TexCoord.x - 0.5) * 2.0;
-    float alpha = u_color.a * distance_from_center;
+    } else if (u_flat == 2) {
+        if (TexCoord.x < u_edge_fraction || TexCoord.x > 1.0 - u_edge_fraction) {
+            // edge strip — grey, same alpha as main colour
+            FragColor = vec4(0.55, 0.55, 0.55, u_color.a);
+        } else {
+            FragColor = vec4(u_color.rgb, u_color.a);
+        }
 
-    FragColor = vec4(u_color.rgb, alpha);
+    } else {
+        // mode 0: hollow — alpha 0 at centre, full at edges
+        float distance_from_center = abs(TexCoord.x - 0.5) * 2.0;
+        FragColor = vec4(u_color.rgb, u_color.a * distance_from_center);
+    }
 }
 """
 
@@ -45,8 +61,29 @@ class PosePathRenderer:
     Gradient: edges solid -> center transparent.
     """
 
-    def __init__(self, width: float = 0.3):
+    def __init__(self, width: float = 0.3,
+                 flat_color: bool = False,
+                 outlined: bool = False):
+        """
+        Parameters
+        ----------
+        width      : ribbon width in metres
+        flat_color : mode 1 — uniform solid colour (replaces hollow default)
+        outlined   : mode 2 — solid centre + 0.1 m grey edge strips
+                     (takes precedence over flat_color)
+        """
         self.width = float(width)
+
+        # Resolve render mode: 2=outlined > 1=flat > 0=hollow
+        if outlined:
+            self._mode = 2
+        elif flat_color:
+            self._mode = 1
+        else:
+            self._mode = 0
+
+        # Width of each grey edge strip in metres (mode 2 only)
+        self.edge_width = 0.1
 
         self.shader = compileProgram(
             compileShader(_LINE_VERTEX_SHADER, GL_VERTEX_SHADER),
@@ -54,9 +91,12 @@ class PosePathRenderer:
         )
 
         glUseProgram(self.shader)
-        self._loc_view  = glGetUniformLocation(self.shader, "view")
-        self._loc_proj  = glGetUniformLocation(self.shader, "projection")
-        self._loc_color = glGetUniformLocation(self.shader, "u_color")
+        self._loc_model     = glGetUniformLocation(self.shader, "model")
+        self._loc_view      = glGetUniformLocation(self.shader, "view")
+        self._loc_proj      = glGetUniformLocation(self.shader, "projection")
+        self._loc_color     = glGetUniformLocation(self.shader, "u_color")
+        self._loc_flat      = glGetUniformLocation(self.shader, "u_flat")
+        self._loc_edge_frac = glGetUniformLocation(self.shader, "u_edge_fraction")
 
         self._vao = glGenVertexArrays(1)
         self._vbo = glGenBuffers(1)
@@ -164,17 +204,30 @@ class PosePathRenderer:
     # ------------------------------------------------------------
 
     def draw(self, view: np.ndarray, projection: np.ndarray,
-             color=(0.2, 0.8, 1.0, 0.8)):
+             color=(0.2, 0.8, 1.0, 0.8),
+             model: np.ndarray = None):
 
         if self._vertex_count == 0:
             return
 
+        if model is None:
+            model = np.identity(4, dtype=np.float32)
+
         glUseProgram(self.shader)
 
+        glUniformMatrix4fv(self._loc_model, 1, GL_FALSE, model)
         glUniformMatrix4fv(self._loc_view, 1, GL_FALSE, view)
         glUniformMatrix4fv(self._loc_proj, 1, GL_FALSE, projection)
 
         glUniform4f(self._loc_color, *color)
+        glUniform1i(self._loc_flat, self._mode)
+
+        # Edge-fraction only meaningful in mode 2; clamp to [0, 0.49]
+        if self._mode == 2:
+            frac = min(self.edge_width / max(self.width, 1e-4), 0.49)
+        else:
+            frac = 0.0
+        glUniform1f(self._loc_edge_frac, frac)
 
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
@@ -192,6 +245,7 @@ _VERTEX_SHADER = """
 layout (location = 0) in vec3 aPos;
 layout (location = 1) in vec3 instanceOffset;
 
+uniform mat4 model;
 uniform mat4 view;
 uniform mat4 projection;
 
@@ -201,7 +255,7 @@ void main()
 {
     vInstanceID = gl_InstanceID;
     vec3 worldPos = aPos + instanceOffset;
-    gl_Position = projection * view * vec4(worldPos, 1.0);
+    gl_Position = projection * view * model * vec4(worldPos, 1.0);
 }
 """
 
@@ -268,9 +322,10 @@ class PathSphereMarkerRenderer:
         )
 
         glUseProgram(self.shader)
-        self._loc_view  = glGetUniformLocation(self.shader, "view")
-        self._loc_proj  = glGetUniformLocation(self.shader, "projection")
-        self._loc_color = glGetUniformLocation(self.shader, "u_color")
+        self._loc_model    = glGetUniformLocation(self.shader, "model")
+        self._loc_view     = glGetUniformLocation(self.shader, "view")
+        self._loc_proj     = glGetUniformLocation(self.shader, "projection")
+        self._loc_color    = glGetUniformLocation(self.shader, "u_color")
         self._loc_selected = glGetUniformLocation(self.shader, "selected_index")
 
         # VAO
@@ -347,12 +402,17 @@ class PathSphereMarkerRenderer:
         glBindBuffer(GL_ARRAY_BUFFER, self._instance_vbo)
         glBufferData(GL_ARRAY_BUFFER, centers.nbytes, centers, GL_DYNAMIC_DRAW)
 
-    def draw(self, view: np.ndarray, projection: np.ndarray):
+    def draw(self, view: np.ndarray, projection: np.ndarray,
+             model: np.ndarray = None):
         if self._instance_count == 0:
             return
 
+        if model is None:
+            model = np.identity(4, dtype=np.float32)
+
         glUseProgram(self.shader)
 
+        glUniformMatrix4fv(self._loc_model, 1, GL_FALSE, model)
         glUniformMatrix4fv(self._loc_view, 1, GL_FALSE, view)
         glUniformMatrix4fv(self._loc_proj, 1, GL_FALSE, projection)
 

@@ -1,6 +1,11 @@
 # Dataset and data folders
 dataset-sdv-feb23/
 dataset-sdv-feb28/
+dataset-sdv-feb28_calib/
+dataset-sdv-mar6/
+dataset-sdv-mar6-2/
+dataset-sdv-mar6-3/
+sync_one_4mar/
 glautolab.egg-info/
 .venv-glautolab/
 .venv/

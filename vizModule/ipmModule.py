@@ -20,6 +20,7 @@ class IpmModule:
 
         self.interpMode = cv2.INTER_LINEAR
         self.ipm_camera_configs = self.dataset.load_ipm_camera_configs()
+        self.intrinsic_configs = self.dataset.load_camera_array_intrinsics()
 
         self.drone_camera = None
         self.set_drone_camera()
@@ -132,9 +133,11 @@ class IpmModule:
             self.masks[i] = mask
 
     def warp_images(self, images: list[np.ndarray | None],
-                    images_mask: list[np.ndarray | None] | None = None):
+                    images_mask: list[np.ndarray | None] | None = None,
+                    feather_blend: bool = False):
 
         warped_images = []
+        warped_weights = []
         warped_masks = []
         if images_mask is not None:
             bev_sidewalk = np.zeros((self.outputRes[0], self.outputRes[1]), dtype=np.uint8)
@@ -151,12 +154,17 @@ class IpmModule:
 
             img = images[i]
 
-            # Optional overlay (for visualization only)
             if images_mask is not None and i < len(images_mask) and images_mask[i] is not None:
                 color_mask, mask_resized = self.colorize_mask(images_mask[i])
-                # img = self.overlay_mask(img, color_mask, alpha=0.4)
 
                 sidewalk_mask = (mask_resized == 1).astype(np.uint8)
+
+                # Undistort mask so it aligns with the pinhole homography
+                if self.intrinsic_configs and i < len(self.intrinsic_configs) and self.intrinsic_configs[i] is not None:
+                    undistorter = self.intrinsic_configs[i]
+                    h, w = sidewalk_mask.shape[:2]
+                    undistorter.ensure_size(w, h)
+                    sidewalk_mask = cv2.remap(sidewalk_mask, undistorter.map1, undistorter.map2, cv2.INTER_NEAREST)
 
                 warped_mask = cv2.warpPerspective(
                     sidewalk_mask,
@@ -165,15 +173,12 @@ class IpmModule:
                     flags=cv2.INTER_NEAREST
                 )
 
-                # Apply invalid mask aligned by camera index
                 if i < len(self.masks) and self.masks[i] is not None:
                     warped_mask[self.masks[i][..., 0]] = 0
 
-                # Fuse using OR
                 bev_sidewalk = np.maximum(bev_sidewalk, warped_mask)
-
                 warped_masks.append(warped_mask)
-                
+
             # Warp to BEV
             warped = cv2.warpPerspective(
                 img,
@@ -182,11 +187,15 @@ class IpmModule:
                 flags=self.interpMode
             )
 
-            # Apply invalid mask (aligned by camera index)
             if i < len(self.masks) and self.masks[i] is not None:
                 warped[self.masks[i]] = 0
 
             warped_images.append(warped)
+
+            if feather_blend:
+                valid = np.any(warped != 0, axis=-1).astype(np.uint8)
+                dist = cv2.distanceTransform(valid, cv2.DIST_L2, 5).astype(np.float32)
+                warped_weights.append(dist)
 
         if not warped_images:
             return None, None, None
@@ -194,17 +203,25 @@ class IpmModule:
         # ---------- Stitch ----------
         H, W = self.outputRes
         birdsEyeView = np.zeros((H, W, 3), dtype=np.float32)
-        count = np.zeros((H, W), dtype=np.float32)
 
-        for warped in warped_images:
-            valid = np.any(warped != 0, axis=-1)
-            birdsEyeView[valid] += warped[valid]
-            count[valid] += 1
+        if feather_blend:
+            weight_sum = np.zeros((H, W), dtype=np.float32)
+            for warped, w in zip(warped_images, warped_weights):
+                birdsEyeView += warped.astype(np.float32) * w[..., None]
+                weight_sum += w
+            weight_sum[weight_sum == 0] = 1
+            birdsEyeView = birdsEyeView / weight_sum[..., None]
+            valid_mask_final = weight_sum > 0
+        else:
+            count = np.zeros((H, W), dtype=np.float32)
+            for warped in warped_images:
+                valid = np.any(warped != 0, axis=-1)
+                birdsEyeView[valid] += warped[valid]
+                count[valid] += 1
+            valid_mask_final = count > 0
+            count[count == 0] = 1
+            birdsEyeView = birdsEyeView / count[..., None]
 
-        valid_mask_final = count > 0
-        count[count == 0] = 1  # avoid div0
-
-        birdsEyeView = birdsEyeView / count[..., None]
         birdsEyeView = np.clip(birdsEyeView, 0, 255).astype(np.uint8)
 
         if not warped_masks:
@@ -598,6 +615,11 @@ class HDMapGridAccumulator:
         self._centerline_pts: Optional[np.ndarray] = None
         self._centerline_edited = False
 
+        # Building polygon spheres (cyan-blue, draggable vertex list)
+        self._bld_spheres = PathSphereMarkerRenderer(radius=0.15, color=(0.2, 0.85, 1.0, 0.9), drag_enabled=True)
+        self._bld_pts: Optional[np.ndarray] = None   # active building polygon control pts (Nx3)
+        self._bld_segments: list = []                # list of stored np.ndarray (Nx3), closed polygons
+
         # Crosswalk spheres (white, draggable endpoint pairs)
         self._crosswalk_spheres = PathSphereMarkerRenderer(radius=0.20, color=(1.0, 1.0, 1.0, 0.9), drag_enabled=True)
         self._crosswalk_pts: list = []               # list of (2,3) float32 arrays, one per crosswalk
@@ -967,8 +989,8 @@ class HDMapGridAccumulator:
         self._polygons_edited = False
         # Keep _edit_snapshot_* so rasterize always restores the BEV base (set in update()), never a dirty grid
 
-    def draw_polygon_spheres(self, view: np.ndarray, projection: np.ndarray):
-        self._polygon_spheres.draw(view, projection)
+    def draw_polygon_spheres(self, view: np.ndarray, projection: np.ndarray, model: np.ndarray = None):
+        self._polygon_spheres.draw(view, projection, model=model)
 
     def sample_polyline_every(self, pts_3d: np.ndarray, step_m: float = 1.0):
         """
@@ -1053,8 +1075,8 @@ class HDMapGridAccumulator:
             return self._centerline_pts
         return self._interpolate_open_curve(self._centerline_pts, samples_per_seg=samples_per_seg)
 
-    def draw_centerline_spheres(self, view: np.ndarray, projection: np.ndarray):
-        self._centerline_spheres.draw(view, projection)
+    def draw_centerline_spheres(self, view: np.ndarray, projection: np.ndarray, model: np.ndarray = None):
+        self._centerline_spheres.draw(view, projection, model=model)
 
     def _interpolate_open_curve(self, pts: np.ndarray, samples_per_seg: int = 5) -> np.ndarray:
         """
@@ -1575,16 +1597,114 @@ class HDMapGridAccumulator:
     # Ribbon draw calls
     # --------------------------------------------------
 
-    def draw_cl_ribbon(self, view: np.ndarray, projection: np.ndarray):
+    def draw_cl_ribbon(self, view: np.ndarray, projection: np.ndarray, model: np.ndarray = None):
         """Draw the centerline as a purple ribbon."""
-        self._cl_ribbon.draw(view, projection, color=(0.6, 0.0, 0.9, 0.85))
+        self._cl_ribbon.draw(view, projection, color=(0.6, 0.0, 0.9, 0.85), model=model)
 
-    def draw_bl_ribbons(self, view: np.ndarray, projection: np.ndarray):
+    def draw_bl_ribbons(self, view: np.ndarray, projection: np.ndarray, model: np.ndarray = None):
         """Draw all bike-lane segments (active + stored) as green ribbons."""
         green = (0.0, 0.85, 0.3, 0.85)
-        self._bl_ribbon_active.draw(view, projection, color=green)
+        self._bl_ribbon_active.draw(view, projection, color=green, model=model)
         for ribbon in self._bl_ribbons:
-            ribbon.draw(view, projection, color=green)
+            ribbon.draw(view, projection, color=green, model=model)
+
+    # --------------------------------------------------
+    # Building polygon add / erase / drag / store / draw
+    # --------------------------------------------------
+
+    def add_vertex_to_building(self, world_point):
+        """
+        Insert a new building polygon control point at the nearest edge of
+        the current polygon (closed loop).  If the polygon is empty the point
+        is just appended; if only 1–2 pts exist it is appended too.
+        """
+        p = np.array(world_point[:3], dtype=np.float32)
+        p[2] = 0.0
+
+        if self._bld_pts is None or len(self._bld_pts) == 0:
+            self._bld_pts = p.reshape(1, 3)
+            return
+        if len(self._bld_pts) < 3:
+            self._bld_pts = np.vstack([self._bld_pts, p])
+            return
+
+        # Find the nearest edge in the *closed* polygon (wrap-around last→first)
+        pts = self._bld_pts
+        n = len(pts)
+        min_dist = float("inf")
+        insert_idx = n  # default: append
+
+        for i in range(n):
+            p0 = pts[i]
+            p1 = pts[(i + 1) % n]
+            v = p1 - p0
+            w = p - p0
+            c1 = float(np.dot(w, v))
+            c2 = float(np.dot(v, v))
+            if c1 <= 0:
+                dist = float(np.linalg.norm(p - p0))
+            elif c2 <= c1:
+                dist = float(np.linalg.norm(p - p1))
+            else:
+                dist = float(np.linalg.norm(p - (p0 + (c1 / c2) * v)))
+            if dist < min_dist:
+                min_dist = dist
+                insert_idx = i + 1  # insert *after* edge start
+
+        self._bld_pts = np.insert(pts, insert_idx, p, axis=0)
+
+    def erase_selected_building_vertex(self):
+        """Remove the currently selected building sphere's control point."""
+        idx = self._bld_spheres._selected_index
+        if idx < 0:
+            return
+        if self._bld_pts is None or len(self._bld_pts) <= 1:
+            self._bld_pts = None
+            return
+        self._bld_pts = np.delete(self._bld_pts, idx, axis=0)
+
+    def sync_building_sphere(self, sphere_index: int):
+        """Commit a moved building sphere back into _bld_pts (no neighbour smoothing)."""
+        if self._bld_pts is None:
+            return
+        if sphere_index < 0 or sphere_index >= len(self._bld_pts):
+            return
+        pos = self._bld_spheres._centers[sphere_index].copy()
+        pos[2] = 0.0
+        self._bld_pts[sphere_index] = pos
+
+    def rebuild_building_spheres(self):
+        """Rebuild sphere renderer from current _bld_pts after add / erase."""
+        if self._bld_pts is None or len(self._bld_pts) == 0:
+            self._bld_spheres.build_from_positions_direct([])
+            return
+        self._bld_spheres.build_from_positions_direct(list(self._bld_pts))
+
+    def get_smooth_building(self, samples_per_seg: int = 5) -> Optional[np.ndarray]:
+        """Return a Catmull-Rom closed-curve interpolation of the active polygon."""
+        if self._bld_pts is None or len(self._bld_pts) < 3:
+            return self._bld_pts
+        return self._interpolate_closed_curve(self._bld_pts, samples_per_seg=samples_per_seg)
+
+    def store_building_segment(self):
+        """
+        Commit the active building polygon (_bld_pts) to the stored list and
+        reset so a new one can be drawn.  Needs at least 3 control points.
+        """
+        if self._bld_pts is None or len(self._bld_pts) < 3:
+            return
+        self._bld_segments.append(self._bld_pts.copy())
+        self._bld_pts = None
+        self._bld_spheres.build_from_positions_direct([])
+
+    def clear_all_buildings(self):
+        """Remove all stored building polygons and clear the active one."""
+        self._bld_segments.clear()
+        self._bld_pts = None
+        self._bld_spheres.build_from_positions_direct([])
+
+    def draw_building_spheres(self, view: np.ndarray, projection: np.ndarray, model: np.ndarray = None):
+        self._bld_spheres.draw(view, projection, model=model)
 
     # --------------------------------------------------
     # Crosswalk add / erase / draw
@@ -1655,6 +1775,53 @@ class HDMapGridAccumulator:
             ], dtype=np.float32))
         return result
 
+    def get_crosswalk_stripe_tris(self) -> list:
+        """
+        Returns a list of (N, 3) float32 arrays of triangle vertices (N % 3 == 0),
+        one array per crosswalk, representing zebra stripes across the crosswalk.
+        """
+        z_offset = 0.07
+        result = []
+        hw = self._crosswalk_width * 0.5
+        for cw in self._crosswalk_pts:
+            p1 = cw[0].astype(np.float64)
+            p2 = cw[1].astype(np.float64)
+            dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+            L = np.sqrt(dx * dx + dy * dy)
+            if L < 1e-6:
+                continue
+            # unit vectors: along and perpendicular to crosswalk direction
+            ux, uy = dx / L, dy / L
+            rx, ry = -dy / L, dx / L
+
+            # Match C++ formula: start with 5 stripes, add 1 per metre beyond 5 m
+            num_stripes = 5
+            if L > 5.0:
+                num_stripes += int((L - 5.0) / 1.0)
+
+            stripe_length = L / (2 * num_stripes)
+            tris: list = []
+            for stripe_idx in range(num_stripes):
+                start_t = stripe_idx * 2 * stripe_length
+                end_t   = start_t + stripe_length
+
+                # Four corners of the stripe rectangle
+                c0 = np.array([ p1[0] + ux * start_t + rx * hw,
+                                 p1[1] + uy * start_t + ry * hw, z_offset], dtype=np.float32)
+                c1 = np.array([ p1[0] + ux * start_t - rx * hw,
+                                 p1[1] + uy * start_t - ry * hw, z_offset], dtype=np.float32)
+                c2 = np.array([ p1[0] + ux * end_t   - rx * hw,
+                                 p1[1] + uy * end_t   - ry * hw, z_offset], dtype=np.float32)
+                c3 = np.array([ p1[0] + ux * end_t   + rx * hw,
+                                 p1[1] + uy * end_t   + ry * hw, z_offset], dtype=np.float32)
+
+                # Fan-triangulate the quad (two triangles)
+                tris.extend([c0, c1, c2, c0, c2, c3])
+
+            if tris:
+                result.append(np.array(tris, dtype=np.float32))
+        return result
+
     def sync_crosswalk_sphere(self, sphere_index: int):
         """Commit the current 3-D position of a moved sphere back to _crosswalk_pts."""
         pair_idx = sphere_index // 2
@@ -1665,8 +1832,176 @@ class HDMapGridAccumulator:
         pos[2] = 0.0
         self._crosswalk_pts[pair_idx][pt_idx] = pos
 
-    def draw_crosswalk_spheres(self, view: np.ndarray, projection: np.ndarray):
-        self._crosswalk_spheres.draw(view, projection)
+    def draw_crosswalk_spheres(self, view: np.ndarray, projection: np.ndarray, model: np.ndarray = None):
+        self._crosswalk_spheres.draw(view, projection, model=model)
 
-    def draw_bike_lane_spheres(self, view: np.ndarray, projection: np.ndarray):
-        self._bike_lane_spheres.draw(view, projection)
+    def draw_bike_lane_spheres(self, view: np.ndarray, projection: np.ndarray, model: np.ndarray = None):
+        self._bike_lane_spheres.draw(view, projection, model=model)
+
+    def draw_all_layers(self, view: np.ndarray, proj: np.ndarray, *,
+                        program,
+                        set_model_color,
+                        model_ipm_plane: np.ndarray,
+                        model_floor_plane: np.ndarray,
+                        ipm_plane,
+                        hd_grid_plane,
+                        hd_boundary_accumulator,
+                        polys: list,
+                        path_center, path_left, path_right,
+                        bld_active_smooth, bld_stored_smooth: list,
+                        bike_lane_center, bike_lane_left, bike_lane_right,
+                        bike_lane_stored: list,
+                        show_ipm: bool,
+                        show_hdmap_texture: bool,
+                        show_bike_lane: bool,
+                        show_buildings: bool,
+                        show_crosswalk: bool) -> None:
+        """Draw every IPM layer: live BEV plane, accumulated HD grid, polygon/sphere/
+        ribbon overlays, buildings, crosswalks, centerline and bike-lane lines."""
+        identity = np.identity(4, dtype=np.float32)
+
+        # Live IPM plane + boundary polygons
+        if show_ipm and ipm_plane.has_texture:
+            ipm_plane.draw(view.T, proj.T, model_ipm_plane.T)
+            if hd_boundary_accumulator.get_polygons() is not None:
+                glUseProgram(program)
+                set_model_color(identity, 1.0, 1.0, 1.0, 1.0)
+                glLineWidth(4.0)
+                for poly in hd_boundary_accumulator.get_polygons():
+                    glBegin(GL_LINE_LOOP)
+                    for p in poly:
+                        glVertex3f(p[0], p[1], p[2] + 0.2)
+                    glEnd()
+                glLineWidth(1.0)
+
+        # Accumulated HD grid plane + all overlays
+        if show_ipm and show_hdmap_texture and hd_grid_plane.has_texture:
+            cx = self.origin_x + self.size_x / 2.0
+            cy = self.origin_y + self.size_y / 2.0
+            cz = model_floor_plane[2, 3] + 0.01
+            grid_model = np.array([
+                [self.size_x, 0, 0, cx],
+                [0, self.size_y, 0, cy],
+                [0, 0,          1, cz],
+                [0, 0,          0,  1],
+            ], dtype=np.float32)
+            hd_grid_plane.draw(view.T, proj.T, grid_model.T)
+
+            if polys:
+                glUseProgram(program)
+                set_model_color(model_floor_plane, 0.0, 1.0, 0.0, 1.0)
+                glLineWidth(4.0)
+                for poly in polys:
+                    glBegin(GL_LINE_LOOP)
+                    for p in poly:
+                        glVertex3f(p[0], p[1], p[2] + 0.05)
+                    glEnd()
+                glLineWidth(1.0)
+                self.draw_polygon_spheres(view.T, proj.T, model=model_floor_plane.T)
+                self.draw_centerline_spheres(view.T, proj.T, model=model_floor_plane.T)
+                self.draw_cl_ribbon(view.T, proj.T, model=model_floor_plane.T)
+
+            if show_bike_lane:
+                self.draw_bike_lane_spheres(view.T, proj.T, model=model_floor_plane.T)
+                self.draw_bl_ribbons(view.T, proj.T, model=model_floor_plane.T)
+
+            if show_buildings:
+                z_lift = 0.06
+                glUseProgram(program)
+                glLineWidth(2.5)
+                if bld_active_smooth is not None and len(bld_active_smooth) >= 2:
+                    set_model_color(model_floor_plane, 0.2, 0.85, 1.0, 1.0)
+                    closed = list(bld_active_smooth) + [bld_active_smooth[0]]
+                    glBegin(GL_LINE_STRIP)
+                    for p in closed:
+                        glVertex3f(float(p[0]), float(p[1]), float(p[2]) + z_lift)
+                    glEnd()
+                for smooth in bld_stored_smooth:
+                    if smooth is None or len(smooth) < 2:
+                        continue
+                    set_model_color(model_floor_plane, 0.2, 0.85, 1.0, 1.0)
+                    closed = list(smooth) + [smooth[0]]
+                    glBegin(GL_LINE_STRIP)
+                    for p in closed:
+                        glVertex3f(float(p[0]), float(p[1]), float(p[2]) + z_lift)
+                    glEnd()
+                glLineWidth(1.0)
+                self.draw_building_spheres(view.T, proj.T, model=model_floor_plane.T)
+                glUseProgram(program)
+
+            if show_crosswalk:
+                corners_list = self.get_crosswalk_corners()
+                if corners_list:
+                    glUseProgram(program)
+                    set_model_color(model_floor_plane, 1.0, 1.0, 1.0, 1.0)
+                    glLineWidth(3.0)
+                    for corners in corners_list:
+                        glBegin(GL_LINE_LOOP)
+                        for c in corners:
+                            glVertex3f(float(c[0]), float(c[1]), float(c[2]) + 0.07)
+                        glEnd()
+                    glLineWidth(1.0)
+                stripe_tris_list = self.get_crosswalk_stripe_tris()
+                if stripe_tris_list:
+                    glUseProgram(program)
+                    set_model_color(model_floor_plane, 1.0, 1.0, 1.0, 0.9)
+                    for tris in stripe_tris_list:
+                        glBegin(GL_TRIANGLES)
+                        for v in tris:
+                            glVertex3f(float(v[0]), float(v[1]), float(v[2]))
+                        glEnd()
+                self.draw_crosswalk_spheres(view.T, proj.T, model=model_floor_plane.T)
+                glUseProgram(program)
+
+            if path_center is not None and len(path_center) >= 2:
+                z_lift = 0.05
+                glUseProgram(program)
+                glLineWidth(3.0)
+                set_model_color(model_floor_plane, 1.0, 1.0, 0.0, 1.0)
+                glBegin(GL_LINE_STRIP)
+                for p in path_center:
+                    glVertex3f(p[0], p[1], p[2] + z_lift)
+                glEnd()
+                if path_left is not None:
+                    set_model_color(model_floor_plane, 0.0, 1.0, 1.0, 1.0)
+                    glBegin(GL_LINE_STRIP)
+                    for p in path_left:
+                        glVertex3f(p[0], p[1], p[2] + z_lift)
+                    glEnd()
+                if path_right is not None:
+                    set_model_color(model_floor_plane, 1.0, 0.0, 1.0, 1.0)
+                    glBegin(GL_LINE_STRIP)
+                    for p in path_right:
+                        glVertex3f(p[0], p[1], p[2] + z_lift)
+                    glEnd()
+                glLineWidth(1.0)
+
+            if show_bike_lane:
+                z_lift = 0.06
+                glUseProgram(program)
+                glLineWidth(3.0)
+
+                def _draw_bl_curve(center, left, right):
+                    if center is not None and len(center) >= 2:
+                        set_model_color(model_floor_plane, 1.0, 0.55, 0.0, 1.0)
+                        glBegin(GL_LINE_STRIP)
+                        for p in center:
+                            glVertex3f(p[0], p[1], p[2] + z_lift)
+                        glEnd()
+                    if left is not None:
+                        set_model_color(model_floor_plane, 1.0, 0.82, 0.4, 1.0)
+                        glBegin(GL_LINE_STRIP)
+                        for p in left:
+                            glVertex3f(p[0], p[1], p[2] + z_lift)
+                        glEnd()
+                    if right is not None:
+                        set_model_color(model_floor_plane, 0.80, 0.35, 0.0, 1.0)
+                        glBegin(GL_LINE_STRIP)
+                        for p in right:
+                            glVertex3f(p[0], p[1], p[2] + z_lift)
+                        glEnd()
+
+                _draw_bl_curve(bike_lane_center, bike_lane_left, bike_lane_right)
+                for (sc, sl, sr) in bike_lane_stored:
+                    _draw_bl_curve(sc, sl, sr)
+                glLineWidth(1.0)

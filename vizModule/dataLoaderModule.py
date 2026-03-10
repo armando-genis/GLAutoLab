@@ -4,6 +4,7 @@ import yaml
 from pathlib import Path
 import re
 import numpy as np
+import cv2
 from PIL import Image, ImageOps
 from collections import defaultdict
 
@@ -59,6 +60,8 @@ class SyncDataset:
         self.lidar_dir = root / "lidar_bins"
         self.pose_dir = root / "tf_yaml"
         self.images_dir_mask = root / "individual_mask"
+        self.skeleton_dir = root / "skeleton_person"
+
         self.mask_resolution = None  # (width, height) when mask images exist
         self.samples = self._index_samples()
         self._index_masks()
@@ -68,6 +71,8 @@ class SyncDataset:
         self.lidar_config = {}
         self.car_settings = None
         self.world_offset_height = 0.0
+
+        self.car_model_file = "rot_sdv"
 
 
 
@@ -94,6 +99,14 @@ class SyncDataset:
             for entry in pose_data.get("scenes", []):
                 idx = int(entry["scene"])
                 samples[idx]["pose"] = entry["pose"]
+
+        skeleton_path = self.skeleton_dir / "detections.yaml"
+        if skeleton_path.exists():
+            with open(skeleton_path, "r") as f:
+                skeleton_data = yaml.load(f, Loader=_DecimalSafeLoader)
+            for entry in skeleton_data.get("scenes", []):
+                idx = int(entry["scene"])
+                samples[idx]["skeleton"] = entry.get("cameras", [])
 
         synced = {
             idx: s
@@ -173,6 +186,13 @@ class SyncDataset:
         return self.ipm_camera_configs
 
     def load_images(self, idx: int):
+        # Build cam_index -> detections lookup for O(1) access per camera
+        skel_by_cam: dict[int, list[dict]] = {}
+        skeleton = self.load_skeleton(idx)
+        if skeleton is not None:
+            for cam_entry in skeleton:
+                skel_by_cam[cam_entry["cam"]] = cam_entry.get("persons", [])
+
         items = sorted(
             self.samples[idx]["images"].items(),
             key=lambda x: _camera_index(x[0]),
@@ -184,6 +204,13 @@ class SyncDataset:
                 img = np.array(pil_img)
 
             cam_idx = _camera_index(cam_name)
+
+            # Draw skeleton on raw pixels before undistortion
+            if cam_idx in skel_by_cam:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                img = self._draw_detections(img, skel_by_cam[cam_idx])
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
             undistorter = (
                 self.camera_array[cam_idx]
                 if self.camera_array and cam_idx < len(self.camera_array)
@@ -197,6 +224,59 @@ class SyncDataset:
             imgs[cam_name] = img
 
         return imgs
+
+    # COCO skeleton connections (0-indexed keypoint pairs)
+    _SKELETON_PAIRS = [
+        (0, 1), (0, 2), (1, 3), (2, 4),
+        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+        (5, 11), (6, 12), (11, 12),
+        (11, 13), (13, 15), (12, 14), (14, 16),
+    ]
+    _KPT_NAMES = [
+        "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+        "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+        "left_wrist", "right_wrist", "left_hip", "right_hip",
+        "left_knee", "right_knee", "left_ankle", "right_ankle",
+    ]
+    _CONF_THR   = 0.3
+    _KPT_COLOR  = (0, 255, 0)
+    _LIMB_COLOR = (0, 165, 255)
+    _BOX_COLOR  = (255, 0, 0)
+    _TEXT_COLOR = (255, 255, 255)
+
+    def _draw_detections(self, img: np.ndarray, persons: list[dict]) -> np.ndarray:
+        """Draw bounding boxes and skeletons for all persons onto a BGR image (in-place)."""
+        for person in persons:
+            b = person["box"]
+            cv2.rectangle(img, (b["x1"], b["y1"]), (b["x2"], b["y2"]),
+                          self._BOX_COLOR, 2, cv2.LINE_AA)
+            cv2.putText(img, f"person {b['conf']:.2f}",
+                        (b["x1"], b["y1"] - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, self._TEXT_COLOR, 1, cv2.LINE_AA)
+
+            kpts = person.get("keypoints", {})
+
+            # Limbs
+            for a, b_idx in self._SKELETON_PAIRS:
+                kpa = kpts.get(self._KPT_NAMES[a])
+                kpb = kpts.get(self._KPT_NAMES[b_idx])
+                if kpa is None or kpb is None:
+                    continue
+                if kpa["conf"] < self._CONF_THR or kpb["conf"] < self._CONF_THR:
+                    continue
+                cv2.line(img,
+                         (int(kpa["x"]), int(kpa["y"])),
+                         (int(kpb["x"]), int(kpb["y"])),
+                         self._LIMB_COLOR, 2, cv2.LINE_AA)
+
+            # Keypoints
+            for kp in kpts.values():
+                if kp["conf"] < self._CONF_THR:
+                    continue
+                cv2.circle(img, (int(kp["x"]), int(kp["y"])),
+                           4, self._KPT_COLOR, -1, cv2.LINE_AA)
+
+        return img
 
     def load_raw_images(self, idx: int):
         items = sorted(
@@ -227,6 +307,31 @@ class SyncDataset:
         roll    = float(pose.get("roll",  0.0))
         pitch   = float(pose.get("pitch", 0.0))
         return xyz, heading, roll, pitch
+
+    def load_skeleton(self, idx: int) -> list[dict] | None:
+        """
+        Return skeleton detections for scene `idx`, or None if unavailable.
+
+        Returns a list of camera dicts (one per camera):
+            [
+                {
+                    "cam": int,
+                    "persons": [
+                        {
+                            "box": {"x1", "y1", "x2", "y2", "conf"},
+                            "keypoints": {
+                                "nose":          {"x", "y", "conf"},
+                                "left_shoulder": {"x", "y", "conf"},
+                                ...
+                            }
+                        },
+                        ...
+                    ]
+                },
+                ...
+            ]
+        """
+        return self.samples[idx].get("skeleton") or None
 
     # Camera Loader Utility
     def _is_fisheye_yaml(self, data: dict) -> bool:
@@ -283,6 +388,8 @@ class SyncDataset:
         width = data["vehicle_config"]["width"]
         height = data["vehicle_config"]["height"]
         length = data["vehicle_config"]["length"]
+        self.car_model_file = data["vehicle_config"]["model_file"]
+
 
         R_Base_to_Lidar = _to_mat_3x3(data["base_link_to_lidar"]["R"])
         t_Base_to_Lidar = _to_vec(data["base_link_to_lidar"]["t"])
@@ -472,14 +579,14 @@ class SyncDataset:
         YCam = float(t_cam_in_base[1, 0])
         ZCam = float(t_cam_in_base[2, 0])
 
-        # print(f"Camera {intrinsic_file} in base frame:")
-        # print("R_cam_in_base:\n", R_cam_in_base)
-        # print("t_cam_in_base:", t_cam_in_base.ravel())
-        # print("--------------------------------")
-        # # print fx, fy, px, py
-        # print(f"fx: {fx:.6f}, fy: {fy:.6f}, px: {px:.6f}, py: {py:.6f}")
-        # print(f"yaw: {yaw:.6f} deg, pitch: {pitch:.6f} deg, roll: {roll:.6f} deg")
-        # print(f"XCam: {XCam:.6f}, YCam: {YCam:.6f}, ZCam: {ZCam:.6f}")
+        print(f"Camera {intrinsic_file} in base frame:")
+        print("R_cam_in_base:\n", R_cam_in_base)
+        print("t_cam_in_base:", t_cam_in_base.ravel())
+        print("--------------------------------")
+        # print fx, fy, px, py
+        print(f"fx: {fx:.6f}, fy: {fy:.6f}, px: {px:.6f}, py: {py:.6f}")
+        print(f"yaw: {yaw:.6f} deg, pitch: {pitch:.6f} deg, roll: {roll:.6f} deg")
+        print(f"XCam: {XCam:.6f}, YCam: {YCam:.6f}, ZCam: {ZCam:.6f}")
 
         return IpmCameraConfig(fx, fy, px, py, yaw, pitch, roll, XCam, YCam, ZCam)
 

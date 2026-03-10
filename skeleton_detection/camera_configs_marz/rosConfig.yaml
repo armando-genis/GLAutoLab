@@ -1,0 +1,11 @@
+# ROS topic config for RosModule (cameras + lidar)
+# Paste full topic names; no prefixes.
+
+lidar_params:
+  lidar_topic: "points_rotated"
+
+camera_params:
+  connection_type: "qos"
+  camera_0_topic: "/racecar/camera/camera_1/image_raw"
+  camera_1_topic: "/racecar/camera/camera_0/image_raw"
+  camera_2_topic: "/racecar/camera/camera_2/image_raw"

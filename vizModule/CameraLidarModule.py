@@ -7,13 +7,22 @@ class CameraLidarModule:
     def __init__(self):
         self.lidar_camera_extrinsics_array = []
         self.camera_array_intrinsics = []
+        self.ipm_camera_configs = []
         self._worker = None
         self._pending_result = None
         self._lock = threading.Lock()
 
+        self.print_ipm_camera_configs()
+
     def load_camera_lidar_parameters(self, dataset):
         self.lidar_camera_extrinsics_array = dataset.load_camera_lidar_extrinsics_array()
         self.camera_array_intrinsics = dataset.load_camera_array_intrinsics()
+        self.ipm_camera_configs = dataset.load_ipm_camera_configs()
+
+    def print_ipm_camera_configs(self):
+        for config in self.ipm_camera_configs:
+            # print the homografic matrix   
+            print(config.homography_matrix)
 
     def transform_cv_to_robot_transform(self, R_ext, t_ext):
 

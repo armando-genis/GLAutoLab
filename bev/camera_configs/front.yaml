@@ -1,0 +1,18 @@
+# camera calibration matrix K
+fx: 1012.013065
+fy: 1012.760136
+px: 982.510670
+py: 527.664867
+
+# rotation matrix R (in deg)
+yaw: -1.519222
+pitch: 11.895747
+roll: 0.778826
+
+# vehicle coords of camera origin (m)
+XCam: 0.159031
+YCam: 0.012203
+ZCam: 2.083274
+# fx: 1012.013065, fy: 1012.760136, px: 982.510670, py: 527.664867
+# yaw: -1.519222 deg, pitch: 11.895747 deg, roll: 0.778826 deg
+# XCam: 0.159031, YCam: 0.012203, ZCam: 2.083274

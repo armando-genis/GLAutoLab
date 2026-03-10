@@ -3,7 +3,7 @@ import ctypes
 import numpy as np
 from OpenGL.GL import *
 from OpenGL.GL.shaders import compileProgram, compileShader
-from PathRendererModule import PosePathRenderer, PathSphereMarkerRenderer
+from PathRendererModule import PosePathRenderer
 
 
 _VERTEX_SHADER = """
@@ -250,7 +250,6 @@ class PoseManager:
         self._renderer = PoseRenderer()
         self._has_pose = False
         self._path_renderer = PosePathRenderer(width=1.5)
-        self._marker_renderer = PathSphereMarkerRenderer()
         self._path_positions = []
 
     def load_all_poses(self, dataset):
@@ -276,7 +275,6 @@ class PoseManager:
 
         self._path_positions = positions
         self._path_renderer.update_from_positions(positions)
-        self._marker_renderer.build_from_path_positions(positions)
 
     @property
     def path_positions(self):
@@ -297,4 +295,3 @@ class PoseManager:
             self._renderer.draw(view, projection)
         if self._has_pose:
             self._path_renderer.draw(view, projection)
-            self._marker_renderer.draw(view, projection)
