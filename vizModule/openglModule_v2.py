@@ -23,6 +23,7 @@ from carModelModule import CarModel
 from ipmModule import IpmModule, TexturedPlane, HDMapBoundaryAccumulator, HDMapGridAccumulator
 from personDetectionModule import PersonDetectionModule
 from hdMapIO import HDMapIO, HDMapData, HDMapRenderer
+from pcdLoaderModule import PcdMapLoader
 
 # ImGui
 class SceneUI:
@@ -82,6 +83,13 @@ class SceneUI:
         self._hdmap_status = ""         # last save/load status message
         self.show_hdmap_render = False  # draw the loaded HD-map snapshot
         self._hdmap_from_json = False  # when True, do not run IPM accumulation (keeps loaded polygon)
+        # PCD map
+        self._pcd_path = "map.pcd"
+        self._pcd_load_requested = False
+        self._pcd_status = ""
+        self.show_pcd_map = False
+        self.pcd_point_size = 1.0   # scaled by ~20 in shader for visibility
+        self.pcd_downsample = True
 
     def load_images_for_scene(self, idx):
         self._textures.clear()
@@ -374,6 +382,26 @@ class SceneUI:
             if self._hdmap_status:
                 imgui.text_colored(self._hdmap_status, 0.4, 1.0, 0.4, 1.0)
 
+            # ── PCD Map ─────────────────────────────────────────────────────
+            imgui.separator()
+            imgui.text("PCD Map")
+
+            changed, new_pcd = imgui.input_text("PCD path", self._pcd_path, 512)
+            if changed:
+                self._pcd_path = new_pcd
+
+            if imgui.button("Load PCD Map"):
+                self._pcd_load_requested = True
+
+            imgui.same_line()
+            _, self.show_pcd_map = imgui.checkbox("Show PCD Map", self.show_pcd_map)
+
+            _, self.pcd_point_size = imgui.slider_float("PCD point size", self.pcd_point_size, 0.1, 10.0)
+            _, self.pcd_downsample = imgui.checkbox("Downsample (max 2M points)", self.pcd_downsample)
+
+            if self._pcd_status:
+                imgui.text_colored(self._pcd_status, 0.4, 1.0, 0.4, 1.0)
+
             imgui.end()
 
         # Images panel
@@ -455,6 +483,9 @@ class Viz:
         self._model_loc_points = glGetUniformLocation(self._program_points, "model")
         self._view_loc_points = glGetUniformLocation(self._program_points, "view")
         self._proj_loc_points = glGetUniformLocation(self._program_points, "projection")
+        self._point_size_loc = glGetUniformLocation(self._program_points, "point_size")
+
+        self._pcd_loader = PcdMapLoader()
 
         self._grid = Grid(half_extent=5.0, step=1.0)
         self._cube = Cube()
@@ -903,6 +934,20 @@ class Viz:
                 except Exception as exc:
                     glUseProgram(self._program)
                     self._ui._hdmap_status = f"Load error: {exc}"
+
+            if self._ui._pcd_load_requested:
+                self._ui._pcd_load_requested = False
+                try:
+                    self._pcd_loader.load(
+                        self._ui._pcd_path,
+                        enable_downsampling=self._ui.pcd_downsample,
+                        max_points=2_000_000,
+                    )
+                    self._ui.show_pcd_map = True
+                    n = self._pcd_loader.get_point_count()
+                    self._ui._pcd_status = f"Loaded PCD: {n} points"
+                except Exception as exc:
+                    self._ui._pcd_status = f"PCD load error: {exc}"
 
             # --------------------------------------------------
             # Mouse handling
@@ -1621,6 +1666,8 @@ class Viz:
                 glUniformMatrix4fv(self._proj_loc_points, 1, GL_FALSE, proj.T)
                 glUniformMatrix4fv(self._view_loc_points, 1, GL_FALSE, view.T)
                 glUniformMatrix4fv(self._model_loc_points, 1, GL_FALSE, self._lidar_model.T)
+                if self._point_size_loc >= 0:
+                    glUniform1f(self._point_size_loc, 2.0)
                 self._pointcloud.draw()
                 glUseProgram(self._program)
 
@@ -1639,8 +1686,16 @@ class Viz:
                 glUniformMatrix4fv(self._proj_loc_points, 1, GL_FALSE, proj.T)
                 glUniformMatrix4fv(self._view_loc_points, 1, GL_FALSE, view.T)
                 glUniformMatrix4fv(self._model_loc_points, 1, GL_FALSE, self._lidar_model.T)
+                if self._point_size_loc >= 0:
+                    glUniform1f(self._point_size_loc, 2.0)
                 if self._ui.show_colored_points:
                     self._colored_pointcloud.draw()
+                # PCD map (world/map frame; point size scaled like C++ example)
+                if self._pcd_loader.is_loaded() and self._ui.show_pcd_map:
+                    glUniformMatrix4fv(self._model_loc_points, 1, GL_FALSE, identity.T)
+                    if self._point_size_loc >= 0:
+                        glUniform1f(self._point_size_loc, self._ui.pcd_point_size * 20.0)
+                    self._pcd_loader.draw()
                 glUseProgram(self._program)
 
                 # Labels: stored in lidar frame, rendered in world space via lidar_model
