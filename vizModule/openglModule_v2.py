@@ -224,9 +224,14 @@ class SceneUI:
 
             imgui.same_line()
 
-            if imgui.button("Erase Vertex"):
-                self._polygon_mode = "erase"
-                self._centerline_mode = None
+            erase_btn = "Deactivate erase" if self._polygon_mode == "erase" else "Erase Vertex (click to activate)"
+            if imgui.button(erase_btn):
+                # Toggle: stay in erase mode until button clicked again
+                if self._polygon_mode == "erase":
+                    self._polygon_mode = None
+                else:
+                    self._polygon_mode = "erase"
+                    self._centerline_mode = None
 
             imgui.separator()
             imgui.text("Centerline Edit")
@@ -487,7 +492,7 @@ class Viz:
 
         self._hd_boundary_accumulator = HDMapBoundaryAccumulator()
 
-        size = 200
+        size = 400
 
         self._hd_grid_acc = HDMapGridAccumulator(
             size_x_m=size,
@@ -1002,6 +1007,7 @@ class Viz:
 
                                     elif polygon_mode == "erase":
                                         self._hd_grid_acc.erase_selected_vertex()
+                                        # Stay in erase mode (don't clear _polygon_mode)
 
                                     self._hd_grid_acc.rebuild_spheres_from_editable()
                                     self._hd_grid_acc.rasterize_edited_polygons_to_grid()
@@ -1019,7 +1025,9 @@ class Viz:
                                     else:
                                         self._path_left, self._path_right = None, None
 
-                                    self._ui._polygon_mode = None
+                                    # Only leave mode after add (one-shot); erase stays until button clicked again
+                                    if polygon_mode == "add":
+                                        self._ui._polygon_mode = None
                                     handled_polygon_mode = True
 
                             # --- Centerline add / erase ---
@@ -1713,7 +1721,7 @@ if __name__ == "__main__":
         "bicycle_lane": Image.open("icons/bike_lane.png"),
     }
 
-    config_dir = Path("camera_configs")
+    config_dir = Path("camera_configs_mar6-3")
 
     dataset.build_camera_array(config_dir)
     dataset.print_camera_info()
