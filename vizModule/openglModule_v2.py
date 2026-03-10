@@ -81,6 +81,7 @@ class SceneUI:
         self._hdmap_load_requested = False
         self._hdmap_status = ""         # last save/load status message
         self.show_hdmap_render = False  # draw the loaded HD-map snapshot
+        self._hdmap_from_json = False  # when True, do not run IPM accumulation (keeps loaded polygon)
 
     def load_images_for_scene(self, idx):
         self._textures.clear()
@@ -204,6 +205,12 @@ class SceneUI:
             changed, self.show_ipm = imgui.checkbox("Show IPM", self.show_ipm)
             if changed:
                 self._needs_reload = True
+
+            # When True, polygon comes from loaded JSON; IPM accumulation is skipped so it won't overwrite
+            if self._hdmap_from_json:
+                imgui.text_colored("Source: Loaded JSON (IPM accumulation disabled)", 0.4, 1.0, 0.4, 1.0)
+                if imgui.button("Compute polygon from IPM"):
+                    self._hdmap_from_json = False
 
             _, self.show_hdmap_texture = imgui.checkbox(
                 "Show HD Map Texture", self.show_hdmap_texture
@@ -674,12 +681,13 @@ class Viz:
             acc._polygons_editable = [p.copy() for p in valid]
             acc._polygons_edited = True
             acc.rebuild_spheres_from_editable()
-            if acc._edit_snapshot_conf is not None:
-                acc.rasterize_edited_polygons_to_grid()
-                rgba = acc.to_rgba(alpha_scale=220)
-                self._hd_grid_plane.set_texture_rgba(rgba)
+            # Always rasterize and show texture so the loaded map is editable (even without prior IPM)
+            acc.rasterize_edited_polygons_to_grid()
+            rgba = acc.to_rgba(alpha_scale=220)
+            self._hd_grid_plane.set_texture_rgba(rgba)
             self._polys = acc.get_editable_polygons() or []
             self._ui.show_edit_polygon = True
+            self._ui.show_hdmap_texture = True  # show the editable map
 
         # ── Centerline ────────────────────────────────────────────────────
         if data.centerline is not None and len(data.centerline) >= 2:
@@ -890,7 +898,8 @@ class Viz:
                         bl_width=self._ui.bike_lane_width,
                     )
                     self._ui.show_hdmap_render = True   # auto-show after load
-                    self._ui._hdmap_status = f"Loaded  ({HDMapIO.summary(data)})"
+                    self._ui._hdmap_from_json = True  # prevent IPM from overwriting loaded polygon
+                    self._ui._hdmap_status = f"Loaded — editable  ({HDMapIO.summary(data)})"
                 except Exception as exc:
                     glUseProgram(self._program)
                     self._ui._hdmap_status = f"Load error: {exc}"
@@ -1486,15 +1495,15 @@ class Viz:
                     if bev_drivable is not None:
                         # poligon set
                         self._hd_boundary_accumulator.update(bev_drivable, self.model_ipm_plane)
-                        # grid accumulation (always; polygon extraction only when checkbox on)
-                        self._hd_grid_acc.update(
-                            bev_drivable,
-                            bev,                 # <-- pass colored BEV image
-                            self.model_ipm_plane
-                        )
-
-                        rgba = self._hd_grid_acc.to_rgba(alpha_scale=220)
-                        self._hd_grid_plane.set_texture_rgba(rgba)
+                        # When map was loaded from JSON, skip IPM accumulation so it doesn't overwrite the polygon
+                        if not self._ui._hdmap_from_json:
+                            self._hd_grid_acc.update(
+                                bev_drivable,
+                                bev,                 # <-- pass colored BEV image
+                                self.model_ipm_plane
+                            )
+                            rgba = self._hd_grid_acc.to_rgba(alpha_scale=220)
+                            self._hd_grid_plane.set_texture_rgba(rgba)
 
                         center = np.array(self._pose.path_positions, dtype=np.float32)
                         if center.ndim == 1:
@@ -1503,7 +1512,8 @@ class Viz:
                             center = np.concatenate([center, np.zeros((len(center), 1), dtype=np.float32)], axis=1)
 
                         if self._ui.show_edit_polygon:
-                            if self._hd_grid_acc._polygons_edited:
+                            # Use editable polygons when edited or when map was loaded from JSON (never re-extract)
+                            if self._hd_grid_acc._polygons_edited or self._ui._hdmap_from_json:
                                 self._polys = self._hd_grid_acc.get_editable_polygons() or []
                             else:
                                 self._polys = self._hd_grid_acc.extract_polygons()
