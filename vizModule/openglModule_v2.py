@@ -687,12 +687,57 @@ class Viz:
     # HD-map persistence helpers
     # ------------------------------------------------------------------
 
+    def _elevate_polygons_to_centerline(
+        self, polygons: list, centerline: np.ndarray
+    ) -> list:
+        """Set each polygon vertex z to the z of the nearest centerline point (by xy)."""
+        if not polygons or centerline is None or len(centerline) < 2:
+            return [p.copy() for p in polygons]
+        cl_xy = centerline[:, :2].astype(np.float64)
+        cl_z = centerline[:, 2]
+        out = []
+        for p in polygons:
+            p = np.asarray(p, dtype=np.float64)
+            if len(p) < 3:
+                out.append(p.copy())
+                continue
+            xy = p[:, :2]
+            # (N_pts, 2) vs (N_cl, 2) -> (N_pts, N_cl) squared distances
+            d2 = np.sum((xy[:, np.newaxis, :] - cl_xy[np.newaxis, :, :]) ** 2, axis=2)
+            idx = np.argmin(d2, axis=1)
+            p_elev = p.copy()
+            p_elev[:, 2] = cl_z[idx]
+            out.append(p_elev.astype(np.float32))
+        return out
+
+    def _elevate_points_to_centerline(
+        self, points: np.ndarray, centerline: np.ndarray
+    ) -> np.ndarray:
+        """Set each point z to the z of the nearest centerline point (by xy)."""
+        if points is None or len(points) == 0 or centerline is None or len(centerline) < 2:
+            return points.copy() if points is not None else points
+        pts = np.asarray(points, dtype=np.float32)
+        if pts.ndim == 1:
+            pts = pts.reshape(1, -1)
+        cl_xy = np.asarray(centerline[:, :2], dtype=np.float64)
+        cl_z = np.asarray(centerline[:, 2], dtype=np.float32)
+        xy = pts[:, :2].astype(np.float64)
+        d2 = np.sum((xy[:, np.newaxis, :] - cl_xy[np.newaxis, :, :]) ** 2, axis=2)
+        idx = np.argmin(d2, axis=1)
+        out = pts.copy()
+        out[:, 2] = cl_z[idx]
+        return out
+
     def _collect_hdmap_data(self) -> HDMapData:
         """Snapshot current editable HD-map state into an HDMapData object."""
         acc = self._hd_grid_acc
+        polygons_raw = [p.copy() for p in acc._polygons_editable] if acc._polygons_editable else []
+        centerline = acc._centerline_pts.copy() if acc._centerline_pts is not None else None
+        # Elevate polygon vertices to centerline z so saved polygon follows terrain like centerline
+        polygons = self._elevate_polygons_to_centerline(polygons_raw, centerline)
         return HDMapData(
-            polygons=[p.copy() for p in acc._polygons_editable] if acc._polygons_editable else [],
-            centerline=acc._centerline_pts.copy() if acc._centerline_pts is not None else None,
+            polygons=polygons,
+            centerline=centerline,
             bike_lane_segments=[s.copy() for s in acc._bike_lane_segments],
             bike_lane_active=acc._bike_lane_pts.copy() if acc._bike_lane_pts is not None else None,
             bike_lane_width=float(self._ui.bike_lane_width),
@@ -800,6 +845,40 @@ class Viz:
         return cam_pos, ray_world
 
     def _draw_ipm_layers(self, view: np.ndarray, proj: np.ndarray) -> None:
+        # Update polygon sphere positions to elevated (centerline z) so yellow spheres sit on the polygon line
+        if (self._ui.show_edit_polygon and self._polys and self._path_center is not None
+                and len(self._path_center) >= 2
+                and not self._hd_grid_acc._polygon_spheres._dragging):
+            elevated = self._elevate_polygons_to_centerline(self._polys, self._path_center)
+            flat = [p for poly in elevated for p in poly]
+            if flat:
+                self._hd_grid_acc._polygon_spheres.build_from_positions_direct(flat)
+
+        # Update bike lane sphere positions to elevated so they sit on the same plane as the polygon
+        if (self._ui.show_bike_lane and self._path_center is not None and len(self._path_center) >= 2
+                and self._hd_grid_acc._bike_lane_pts is not None and len(self._hd_grid_acc._bike_lane_pts) > 0
+                and not self._hd_grid_acc._bike_lane_spheres._dragging):
+            elevated_bl = self._elevate_points_to_centerline(
+                self._hd_grid_acc._bike_lane_pts, self._path_center
+            )
+            if elevated_bl is not None and len(elevated_bl) > 0:
+                self._hd_grid_acc._bike_lane_spheres.build_from_positions_direct(list(elevated_bl))
+
+        # Update crosswalk sphere positions to elevated so they sit on the same plane as the polygon
+        if (self._ui.show_crosswalk and self._path_center is not None and len(self._path_center) >= 2
+                and not self._hd_grid_acc._crosswalk_spheres._dragging):
+            cw_flat = []
+            for cw in self._hd_grid_acc._crosswalk_pts:
+                cw_flat.append(cw[0])
+                cw_flat.append(cw[1])
+            if self._hd_grid_acc._crosswalk_pending is not None:
+                cw_flat.append(self._hd_grid_acc._crosswalk_pending)
+            if cw_flat:
+                elevated_cw = self._elevate_points_to_centerline(
+                    np.asarray(cw_flat, dtype=np.float32), self._path_center
+                )
+                self._hd_grid_acc._crosswalk_spheres.build_from_positions_direct(list(elevated_cw))
+
         self._hd_grid_acc.draw_all_layers(
             view, proj,
             program=self._program,
@@ -985,20 +1064,21 @@ class Viz:
                         cam_pos_m, ray_dir_m = self._ray_to_model_space(cam_pos, ray_dir, self.model_floor_plane)
 
                         if self._ui.show_edit_polygon:
-                            poly_res = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos_m, ray_dir_m)
-                            cl_res   = self._hd_grid_acc._centerline_spheres.intersect_ray(cam_pos_m, ray_dir_m)
+                            # Polygon and centerline spheres are in world space; use world ray
+                            poly_res = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos, ray_dir)
+                            cl_res   = self._hd_grid_acc._centerline_spheres.intersect_ray(cam_pos, ray_dir)
                             if poly_res is not None and poly_res[1] < best_t:
                                 best_t = poly_res[1]; best_kind = "polygon"; best_idx = poly_res[0]
                             if cl_res is not None and cl_res[1] < best_t:
                                 best_t = cl_res[1]; best_kind = "centerline"; best_idx = cl_res[0]
 
                         if self._ui.show_bike_lane:
-                            bl_res = self._hd_grid_acc._bike_lane_spheres.intersect_ray(cam_pos_m, ray_dir_m)
+                            bl_res = self._hd_grid_acc._bike_lane_spheres.intersect_ray(cam_pos, ray_dir)
                             if bl_res is not None and bl_res[1] < best_t:
                                 best_t = bl_res[1]; best_kind = "bike_lane"; best_idx = bl_res[0]
 
                         if self._ui.show_crosswalk:
-                            cw_res = self._hd_grid_acc._crosswalk_spheres.intersect_ray(cam_pos_m, ray_dir_m)
+                            cw_res = self._hd_grid_acc._crosswalk_spheres.intersect_ray(cam_pos, ray_dir)
                             if cw_res is not None and cw_res[1] < best_t:
                                 best_t = cw_res[1]; best_kind = "crosswalk"; best_idx = cw_res[0]
 
@@ -1009,16 +1089,16 @@ class Viz:
 
                         if best_kind == "polygon":
                             self._hd_grid_acc._polygon_spheres.select(best_idx)
-                            self._hd_grid_acc._polygon_spheres.begin_drag(cam_pos_m, ray_dir_m)
+                            self._hd_grid_acc._polygon_spheres.begin_drag(cam_pos, ray_dir)
                         elif best_kind == "centerline":
                             self._hd_grid_acc._centerline_spheres.select(best_idx)
-                            self._hd_grid_acc._centerline_spheres.begin_drag(cam_pos_m, ray_dir_m)
+                            self._hd_grid_acc._centerline_spheres.begin_drag(cam_pos, ray_dir)
                         elif best_kind == "bike_lane":
                             self._hd_grid_acc._bike_lane_spheres.select(best_idx)
-                            self._hd_grid_acc._bike_lane_spheres.begin_drag(cam_pos_m, ray_dir_m)
+                            self._hd_grid_acc._bike_lane_spheres.begin_drag(cam_pos, ray_dir)
                         elif best_kind == "crosswalk":
                             self._hd_grid_acc._crosswalk_spheres.select(best_idx)
-                            self._hd_grid_acc._crosswalk_spheres.begin_drag(cam_pos_m, ray_dir_m)
+                            self._hd_grid_acc._crosswalk_spheres.begin_drag(cam_pos, ray_dir)
                         elif best_kind == "building":
                             self._hd_grid_acc._bld_spheres.select(best_idx)
                             self._hd_grid_acc._bld_spheres.begin_drag(cam_pos_m, ray_dir_m)
@@ -1130,6 +1210,11 @@ class Viz:
                                         else:
                                             hit = None
                                         if hit is not None:
+                                            if self._path_center is not None and len(self._path_center) >= 2:
+                                                cl_xy = np.asarray(self._path_center)[:, :2].astype(np.float64)
+                                                cl_z = np.asarray(self._path_center)[:, 2]
+                                                d2 = np.sum((cl_xy - np.array([hit[0], hit[1]], dtype=np.float64)) ** 2, axis=1)
+                                                hit[2] = float(cl_z[np.argmin(d2)])
                                             self._hd_grid_acc.add_vertex_to_bike_lane(hit)
 
                                     elif bike_lane_mode == "erase":
@@ -1170,14 +1255,18 @@ class Viz:
                                         else:
                                             hit = None
                                         if hit is not None:
+                                            if self._path_center is not None and len(self._path_center) >= 2:
+                                                cl_xy = np.asarray(self._path_center)[:, :2].astype(np.float64)
+                                                cl_z = np.asarray(self._path_center)[:, 2]
+                                                d2 = np.sum((cl_xy - np.array([hit[0], hit[1]], dtype=np.float64)) ** 2, axis=1)
+                                                hit[2] = float(cl_z[np.argmin(d2)])
                                             completed = self._hd_grid_acc.add_crosswalk_point(hit)
                                             if completed:
                                                 self._ui._crosswalk_mode = None
                                             # else: keep "add" mode — waiting for second click
 
                                     elif cw_mode == "erase":
-                                        cam_pos_m, ray_dir_m = self._ray_to_model_space(cam_pos, ray_dir, self.model_floor_plane)
-                                        cw_res = self._hd_grid_acc._crosswalk_spheres.intersect_ray(cam_pos_m, ray_dir_m)
+                                        cw_res = self._hd_grid_acc._crosswalk_spheres.intersect_ray(cam_pos, ray_dir)
                                         if cw_res is not None:
                                             self._hd_grid_acc._crosswalk_spheres.select(cw_res[0])
                                             self._hd_grid_acc.erase_selected_crosswalk()
@@ -1204,10 +1293,9 @@ class Viz:
                                         min_label_t = t
                                         closest_label = i
 
-                                # polygon sphere pick — only when edit-polygon mode
+                                # polygon sphere pick — world space (polygon spheres are in world)
                                 if self._ui.show_edit_polygon:
-                                    cam_pos_m, ray_dir_m = self._ray_to_model_space(cam_pos, ray_dir, self.model_floor_plane)
-                                    polygon_result = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos_m, ray_dir_m)
+                                    polygon_result = self._hd_grid_acc._polygon_spheres.intersect_ray(cam_pos, ray_dir)
                                     if polygon_result is not None:
                                         polygon_idx, polygon_t = polygon_result
                                     else:
@@ -1302,9 +1390,7 @@ class Viz:
                             x, y, width, height,
                             inv_proj, inv_view, cam_pos_world
                         )
-                        cam_pos_m, ray_dir_m = self._ray_to_model_space(cam_pos, ray_dir, self.model_floor_plane)
-
-                        self._hd_grid_acc._polygon_spheres.drag(cam_pos_m, ray_dir_m)
+                        self._hd_grid_acc._polygon_spheres.drag(cam_pos, ray_dir)
                         idx = self._hd_grid_acc._polygon_spheres._selected_index
                         if idx >= 0:
                             self._hd_grid_acc.sync_sphere_to_polygon(idx)
@@ -1329,9 +1415,7 @@ class Viz:
                             x, y, width, height,
                             inv_proj, inv_view, cam_pos_world
                         )
-                        cam_pos_m, ray_dir_m = self._ray_to_model_space(cam_pos, ray_dir, self.model_floor_plane)
-
-                        self._hd_grid_acc._centerline_spheres.drag(cam_pos_m, ray_dir_m)
+                        self._hd_grid_acc._centerline_spheres.drag(cam_pos, ray_dir)
                         idx = self._hd_grid_acc._centerline_spheres._selected_index
                         if idx >= 0:
                             self._hd_grid_acc.sync_centerline_sphere(idx)
@@ -1358,16 +1442,14 @@ class Viz:
                             x, y, width, height,
                             inv_proj, inv_view, cam_pos_world
                         )
-                        cam_pos_m, ray_dir_m = self._ray_to_model_space(cam_pos, ray_dir, self.model_floor_plane)
-
-                        self._hd_grid_acc._bike_lane_spheres.drag(cam_pos_m, ray_dir_m)
+                        self._hd_grid_acc._bike_lane_spheres.drag(cam_pos, ray_dir)
                         idx = self._hd_grid_acc._bike_lane_spheres._selected_index
                         if idx >= 0:
                             self._hd_grid_acc.sync_bike_lane_sphere(idx)
                             self._refresh_bike_lane()
 
                     elif self._hd_grid_acc._crosswalk_spheres._dragging and not self._ui._live_topic_mode and self._ui.show_crosswalk:
-                        # Drag a crosswalk endpoint sphere
+                        # Drag a crosswalk endpoint sphere (world space)
                         inv_proj = np.linalg.inv(proj)
                         inv_view = np.linalg.inv(view)
                         cam_pos_world = inv_view[:3, 3]
@@ -1376,9 +1458,7 @@ class Viz:
                             x, y, width, height,
                             inv_proj, inv_view, cam_pos_world
                         )
-                        cam_pos_m, ray_dir_m = self._ray_to_model_space(cam_pos, ray_dir, self.model_floor_plane)
-
-                        self._hd_grid_acc._crosswalk_spheres.drag(cam_pos_m, ray_dir_m)
+                        self._hd_grid_acc._crosswalk_spheres.drag(cam_pos, ray_dir)
                         idx = self._hd_grid_acc._crosswalk_spheres._selected_index
                         if idx >= 0:
                             self._hd_grid_acc.sync_crosswalk_sphere(idx)
@@ -1550,18 +1630,22 @@ class Viz:
                             rgba = self._hd_grid_acc.to_rgba(alpha_scale=220)
                             self._hd_grid_plane.set_texture_rgba(rgba)
 
+                        # Path in world frame (x,y) or (x,y,z); preserve z when present, else use floor level
+                        floor_z = float(self.model_floor_plane[2, 3])
                         center = np.array(self._pose.path_positions, dtype=np.float32)
                         if center.ndim == 1:
-                            center = center.reshape(-1, 2)
+                            center = center.reshape(1, -1)
                         if center.shape[1] == 2:
-                            center = np.concatenate([center, np.zeros((len(center), 1), dtype=np.float32)], axis=1)
+                            center = np.concatenate(
+                                [center, np.full((len(center), 1), floor_z, dtype=np.float32)], axis=1
+                            )
 
                         if self._ui.show_edit_polygon:
                             # Use editable polygons when edited or when map was loaded from JSON (never re-extract)
                             if self._hd_grid_acc._polygons_edited or self._ui._hdmap_from_json:
                                 self._polys = self._hd_grid_acc.get_editable_polygons() or []
                             else:
-                                self._polys = self._hd_grid_acc.extract_polygons()
+                                self._polys = self._hd_grid_acc.extract_polygons(floor_z=floor_z)
                                 self._hd_grid_acc.update_polygon_spheres(self._polys)
                             # reset centerline spheres only if the user hasn't manually edited them
                             if not self._hd_grid_acc._centerline_edited:
@@ -1591,18 +1675,21 @@ class Viz:
                 # When user checks "Edit polygon" without reloading: extract once from current grid
                 if self._ui._needs_polygon_extract and self._ui.show_edit_polygon and self._hd_grid_plane.has_texture:
                     self._ui._needs_polygon_extract = False
+                    floor_z = float(self.model_floor_plane[2, 3])
                     if self._hd_grid_acc._polygons_edited:
                         self._polys = self._hd_grid_acc.get_editable_polygons() or []
                     else:
-                        self._polys = self._hd_grid_acc.extract_polygons()
+                        self._polys = self._hd_grid_acc.extract_polygons(floor_z=floor_z)
                         self._hd_grid_acc.update_polygon_spheres(self._polys)
                     left, right = None, None
                     if self._polys and self._pose.path_positions is not None and len(self._pose.path_positions) >= 2:
                         center = np.array(self._pose.path_positions, dtype=np.float32)
                         if center.ndim == 1:
-                            center = center.reshape(-1, 2)
+                            center = center.reshape(1, -1)
                         if center.shape[1] == 2:
-                            center = np.concatenate([center, np.zeros((len(center), 1), dtype=np.float32)], axis=1)
+                            center = np.concatenate(
+                                [center, np.full((len(center), 1), floor_z, dtype=np.float32)], axis=1
+                            )
                         if not self._hd_grid_acc._centerline_edited:
                             self._hd_grid_acc.update_centerline_spheres(center)
                         _cl_smooth = self._hd_grid_acc.get_smooth_centerline()

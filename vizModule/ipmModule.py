@@ -750,10 +750,11 @@ class HDMapGridAccumulator:
 
         return rgba
 
-    def extract_polygons(self, min_area_cells=10, simplify_eps_cells=1.5):
+    def extract_polygons(self, min_area_cells=10, simplify_eps_cells=1.5, floor_z: float = 0.0):
         """
         Extract world-space polygons from the persistent HD grid.
         Returns list of Nx3 world coordinate arrays.
+        floor_z: z coordinate in world for the polygon (same level as model_floor_plane).
         """
 
         # -----------------------------
@@ -773,6 +774,7 @@ class HDMapGridAccumulator:
         contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         polygons_world = []
+        floor_z = float(floor_z)
 
         for cnt in contours:
 
@@ -789,11 +791,11 @@ class HDMapGridAccumulator:
 
             for gx, gy in pts:
 
-                # Grid index → world meters
+                # Grid index → world meters (xy from grid, z at floor level)
                 wx = self.origin_x + (gx + 0.5) * self.res
                 wy = self.origin_y + (gy + 0.5) * self.res
 
-                world_poly.append([wx, wy, 0.0])
+                world_poly.append([wx, wy, floor_z])
 
             if len(world_poly) >= 3:
                 polygons_world.append(np.asarray(world_poly, dtype=np.float32))
@@ -886,7 +888,8 @@ class HDMapGridAccumulator:
             return
 
         center = self._polygon_spheres._centers[sphere_index].copy()
-        center[2] = 0.0
+        # Sphere is drawn at z + sphere_height; store ground-level z in polygon
+        center[2] -= getattr(self._polygon_spheres, "sphere_height", 0.40)
 
         # 1️⃣ update moved vertex
         poly[point_idx] = center
@@ -905,7 +908,7 @@ class HDMapGridAccumulator:
             if poly_idx >= len(self._polygons_editable) or point_idx >= len(self._polygons_editable[poly_idx]):
                 continue
             center = self._polygon_spheres._centers[sphere_index].copy()
-            center[2] = 0.0
+            center[2] -= getattr(self._polygon_spheres, "sphere_height", 0.40)
             self._polygons_editable[poly_idx][point_idx] = center
 
     def get_editable_polygons(self) -> Optional[List[np.ndarray]]:
@@ -1041,14 +1044,20 @@ class HDMapGridAccumulator:
             return
         sampled = self.sample_polyline_every(positions, step_m=1.0)
         self._centerline_pts = np.asarray(sampled, dtype=np.float32)
-        self._centerline_pts[:, 2] = 0.0   # force ground plane
+        if self._centerline_pts.ndim == 1:
+            self._centerline_pts = np.expand_dims(self._centerline_pts, 0)
+        if self._centerline_pts.shape[1] == 2:
+            self._centerline_pts = np.concatenate(
+                [self._centerline_pts, np.zeros((len(self._centerline_pts), 1), dtype=np.float32)], axis=1
+            )
+        # keep path z (do not force ground plane) so centerline follows car elevation
         self._centerline_edited = False
         self._centerline_spheres.build_from_positions_direct(list(self._centerline_pts))
 
     def sync_centerline_sphere(self, sphere_index: int):
         """
-        Commit the moved sphere position into _centerline_pts (z forced to 0).
-        No smoothing: only the dragged point moves, neighbours are untouched.
+        Commit the moved sphere position into _centerline_pts (z preserved so
+        path can follow elevation). No smoothing: only the dragged point moves.
         The GPU buffer for this sphere is already updated by drag(), so no extra
         GL work is needed here.
         """
@@ -1057,7 +1066,6 @@ class HDMapGridAccumulator:
         if sphere_index < 0 or sphere_index >= len(self._centerline_pts):
             return
         pos = self._centerline_spheres._centers[sphere_index].copy()
-        pos[2] = 0.0
         self._centerline_pts[sphere_index] = pos
         self._centerline_edited = True
 
@@ -1221,6 +1229,7 @@ class HDMapGridAccumulator:
             return None, None
 
         pts = centerline[:, :2]
+        z_col = centerline[:, 2:3] if centerline.shape[1] >= 3 else np.zeros((len(centerline), 1), dtype=np.float32)
 
         # Tangent using gradient
         d = np.gradient(pts, axis=0)
@@ -1235,8 +1244,8 @@ class HDMapGridAccumulator:
         left_xy  = pts + n * half
         right_xy = pts - n * half
 
-        left  = np.concatenate([left_xy,  np.zeros((len(left_xy), 1))], axis=1)
-        right = np.concatenate([right_xy, np.zeros((len(right_xy), 1))], axis=1)
+        left  = np.concatenate([left_xy,  z_col], axis=1)
+        right = np.concatenate([right_xy, z_col], axis=1)
 
         return left.astype(np.float32), right.astype(np.float32)
 
@@ -1262,6 +1271,7 @@ class HDMapGridAccumulator:
 
         poly = polygon_world[:, :2]
         center = centerline_world[:, :2]
+        center_z = centerline_world[:, 2] if centerline_world.shape[1] >= 3 else np.zeros(len(centerline_world), dtype=np.float32)
 
         # Precompute centerline tangents
         d = np.gradient(center, axis=0)
@@ -1279,6 +1289,7 @@ class HDMapGridAccumulator:
 
             c = center[idx]
             t = tangents[idx]
+            z_at = float(center_z[idx])
 
             # vector from centerline to polygon point
             v = p - c
@@ -1287,9 +1298,9 @@ class HDMapGridAccumulator:
             cross = t[0] * v[1] - t[1] * v[0]
 
             if cross > 0:
-                left_pts.append([p[0], p[1], 0.0])
+                left_pts.append([p[0], p[1], z_at])
             else:
-                right_pts.append([p[0], p[1], 0.0])
+                right_pts.append([p[0], p[1], z_at])
 
         if len(left_pts) < 2 or len(right_pts) < 2:
             return None, None
@@ -1436,6 +1447,7 @@ class HDMapGridAccumulator:
         """
         Initialise (or reset) the bike lane from a set of world positions,
         resampled at 1 m intervals.  Pass an empty array / None to clear.
+        Preserves z from positions when available (path elevation).
         """
         if positions is None or len(positions) == 0:
             self._bike_lane_pts = None
@@ -1444,18 +1456,23 @@ class HDMapGridAccumulator:
             return
         sampled = self.sample_polyline_every(positions, step_m=1.0)
         self._bike_lane_pts = np.asarray(sampled, dtype=np.float32)
-        self._bike_lane_pts[:, 2] = 0.0
+        if self._bike_lane_pts.ndim == 1:
+            self._bike_lane_pts = np.expand_dims(self._bike_lane_pts, 0)
+        if self._bike_lane_pts.shape[1] == 2:
+            self._bike_lane_pts = np.concatenate(
+                [self._bike_lane_pts, np.zeros((len(self._bike_lane_pts), 1), dtype=np.float32)], axis=1
+            )
         self._bike_lane_edited = False
         self._bike_lane_spheres.build_from_positions_direct(list(self._bike_lane_pts))
 
     def sync_bike_lane_sphere(self, sphere_index: int):
-        """Commit a moved bike-lane sphere into _bike_lane_pts (no neighbour smoothing)."""
+        """Commit a moved bike-lane sphere into _bike_lane_pts (store ground-level z)."""
         if self._bike_lane_pts is None:
             return
         if sphere_index < 0 or sphere_index >= len(self._bike_lane_pts):
             return
         pos = self._bike_lane_spheres._centers[sphere_index].copy()
-        pos[2] = 0.0
+        pos[2] -= getattr(self._bike_lane_spheres, "sphere_height", 0.40)
         self._bike_lane_pts[sphere_index] = pos
         self._bike_lane_edited = True
 
@@ -1469,9 +1486,11 @@ class HDMapGridAccumulator:
         """
         Insert a new bike-lane control point at the nearest edge of the
         existing polyline.  If the lane is empty the point is just appended.
+        world_point[2] is preserved (e.g. centerline elevation from caller).
         """
         p = np.array(world_point[:3], dtype=np.float32)
-        p[2] = 0.0
+        if len(p) < 3:
+            p = np.append(p, 0.0)
 
         if self._bike_lane_pts is None or len(self._bike_lane_pts) == 0:
             self._bike_lane_pts = p.reshape(1, 3)
@@ -1715,9 +1734,11 @@ class HDMapGridAccumulator:
         Two-click crosswalk placement.
         First call stores the pending first point and returns False.
         Second call creates the crosswalk, clears the pending point, returns True.
+        world_point[2] is preserved (e.g. centerline elevation from caller).
         """
         p = np.array(world_point[:3], dtype=np.float32)
-        p[2] = 0.0
+        if len(p) < 3:
+            p = np.append(p, 0.0)
         if self._crosswalk_pending is None:
             self._crosswalk_pending = p
             self._rebuild_cw_spheres(include_pending=True)
@@ -1823,13 +1844,13 @@ class HDMapGridAccumulator:
         return result
 
     def sync_crosswalk_sphere(self, sphere_index: int):
-        """Commit the current 3-D position of a moved sphere back to _crosswalk_pts."""
+        """Commit the current 3-D position of a moved sphere back to _crosswalk_pts (ground-level z)."""
         pair_idx = sphere_index // 2
         pt_idx   = sphere_index % 2
         if pair_idx >= len(self._crosswalk_pts):
             return
         pos = self._crosswalk_spheres._centers[sphere_index].copy()
-        pos[2] = 0.0
+        pos[2] -= getattr(self._crosswalk_spheres, "sphere_height", 0.40)
         self._crosswalk_pts[pair_idx][pt_idx] = pos
 
     def draw_crosswalk_spheres(self, view: np.ndarray, projection: np.ndarray, model: np.ndarray = None):
@@ -1857,8 +1878,44 @@ class HDMapGridAccumulator:
                         show_buildings: bool,
                         show_crosswalk: bool) -> None:
         """Draw every IPM layer: live BEV plane, accumulated HD grid, polygon/sphere/
-        ribbon overlays, buildings, crosswalks, centerline and bike-lane lines."""
+        ribbon overlays, buildings, crosswalks, centerline and bike-lane lines.
+        Polygon is elevated to centerline z so it aligns with the blue path; all
+        drawn in world space (identity) so spheres and ray hit-test match."""
         identity = np.identity(4, dtype=np.float32)
+
+        def _elevate_polys_to_centerline(poly_list, centerline):
+            """Set each polygon vertex z to nearest centerline z (by xy). Returns new list."""
+            if not poly_list or centerline is None or len(centerline) < 2:
+                return [np.asarray(p, dtype=np.float32).copy() for p in poly_list]
+            cl_xy = np.asarray(centerline[:, :2], dtype=np.float64)
+            cl_z = np.asarray(centerline[:, 2], dtype=np.float32)
+            out = []
+            for p in poly_list:
+                p = np.asarray(p, dtype=np.float32)
+                if len(p) < 3:
+                    out.append(p.copy())
+                    continue
+                xy = p[:, :2].astype(np.float64)
+                d2 = np.sum((xy[:, np.newaxis, :] - cl_xy[np.newaxis, :, :]) ** 2, axis=2)
+                idx = np.argmin(d2, axis=1)
+                p_elev = p.copy()
+                p_elev[:, 2] = cl_z[idx]
+                out.append(p_elev)
+            return out
+
+        def _elevate_pts_to_centerline(pts, centerline):
+            """Set each point z to nearest centerline z (by xy). pts (N,3), returns (N,3)."""
+            if pts is None or len(pts) == 0 or centerline is None or len(centerline) < 2:
+                return pts if pts is None else np.asarray(pts, dtype=np.float32).copy()
+            pts = np.asarray(pts, dtype=np.float32)
+            cl_xy = np.asarray(centerline[:, :2], dtype=np.float64)
+            cl_z = np.asarray(centerline[:, 2], dtype=np.float32)
+            xy = pts[:, :2].astype(np.float64)
+            d2 = np.sum((xy[:, np.newaxis, :] - cl_xy[np.newaxis, :, :]) ** 2, axis=2)
+            idx = np.argmin(d2, axis=1)
+            out = pts.copy()
+            out[:, 2] = cl_z[idx]
+            return out
 
         # Live IPM plane + boundary polygons
         if show_ipm and ipm_plane.has_texture:
@@ -1888,22 +1945,26 @@ class HDMapGridAccumulator:
             hd_grid_plane.draw(view.T, proj.T, grid_model.T)
 
             if polys:
+                # Elevate polygon to centerline z so polygon line and spheres align with blue path
+                polys_elev = _elevate_polys_to_centerline(polys, path_center)
+                z_lift = 0.05
                 glUseProgram(program)
-                set_model_color(model_floor_plane, 0.0, 1.0, 0.0, 1.0)
+                set_model_color(identity, 0.0, 1.0, 0.0, 1.0)
                 glLineWidth(4.0)
-                for poly in polys:
+                for poly in polys_elev:
                     glBegin(GL_LINE_LOOP)
                     for p in poly:
-                        glVertex3f(p[0], p[1], p[2] + 0.05)
+                        glVertex3f(p[0], p[1], p[2] + z_lift)
                     glEnd()
                 glLineWidth(1.0)
-                self.draw_polygon_spheres(view.T, proj.T, model=model_floor_plane.T)
-                self.draw_centerline_spheres(view.T, proj.T, model=model_floor_plane.T)
-                self.draw_cl_ribbon(view.T, proj.T, model=model_floor_plane.T)
+                # Spheres are updated to elevated positions by caller; draw in world (identity)
+                self.draw_polygon_spheres(view.T, proj.T, model=identity.T)
+                self.draw_centerline_spheres(view.T, proj.T, model=identity.T)
+                self.draw_cl_ribbon(view.T, proj.T, model=identity.T)
 
             if show_bike_lane:
-                self.draw_bike_lane_spheres(view.T, proj.T, model=model_floor_plane.T)
-                self.draw_bl_ribbons(view.T, proj.T, model=model_floor_plane.T)
+                self.draw_bike_lane_spheres(view.T, proj.T, model=identity.T)
+                self.draw_bl_ribbons(view.T, proj.T, model=identity.T)
 
             if show_buildings:
                 z_lift = 0.06
@@ -1933,9 +1994,11 @@ class HDMapGridAccumulator:
                 corners_list = self.get_crosswalk_corners()
                 if corners_list:
                     glUseProgram(program)
-                    set_model_color(model_floor_plane, 1.0, 1.0, 1.0, 1.0)
+                    set_model_color(identity, 1.0, 1.0, 1.0, 1.0)
                     glLineWidth(3.0)
                     for corners in corners_list:
+                        if path_center is not None and len(path_center) >= 2:
+                            corners = _elevate_pts_to_centerline(corners, path_center)
                         glBegin(GL_LINE_LOOP)
                         for c in corners:
                             glVertex3f(float(c[0]), float(c[1]), float(c[2]) + 0.07)
@@ -1944,32 +2007,35 @@ class HDMapGridAccumulator:
                 stripe_tris_list = self.get_crosswalk_stripe_tris()
                 if stripe_tris_list:
                     glUseProgram(program)
-                    set_model_color(model_floor_plane, 1.0, 1.0, 1.0, 0.9)
+                    set_model_color(identity, 1.0, 1.0, 1.0, 0.9)
                     for tris in stripe_tris_list:
+                        if path_center is not None and len(path_center) >= 2:
+                            tris = _elevate_pts_to_centerline(tris, path_center)
                         glBegin(GL_TRIANGLES)
                         for v in tris:
                             glVertex3f(float(v[0]), float(v[1]), float(v[2]))
                         glEnd()
-                self.draw_crosswalk_spheres(view.T, proj.T, model=model_floor_plane.T)
+                self.draw_crosswalk_spheres(view.T, proj.T, model=identity.T)
                 glUseProgram(program)
 
             if path_center is not None and len(path_center) >= 2:
+                # Centerline = blue path; draw in world (identity) so ray hit-test matches
                 z_lift = 0.05
                 glUseProgram(program)
                 glLineWidth(3.0)
-                set_model_color(model_floor_plane, 1.0, 1.0, 0.0, 1.0)
+                set_model_color(identity, 1.0, 1.0, 0.0, 1.0)
                 glBegin(GL_LINE_STRIP)
                 for p in path_center:
                     glVertex3f(p[0], p[1], p[2] + z_lift)
                 glEnd()
                 if path_left is not None:
-                    set_model_color(model_floor_plane, 0.0, 1.0, 1.0, 1.0)
+                    set_model_color(identity, 0.0, 1.0, 1.0, 1.0)
                     glBegin(GL_LINE_STRIP)
                     for p in path_left:
                         glVertex3f(p[0], p[1], p[2] + z_lift)
                     glEnd()
                 if path_right is not None:
-                    set_model_color(model_floor_plane, 1.0, 0.0, 1.0, 1.0)
+                    set_model_color(identity, 1.0, 0.0, 1.0, 1.0)
                     glBegin(GL_LINE_STRIP)
                     for p in path_right:
                         glVertex3f(p[0], p[1], p[2] + z_lift)
@@ -1983,19 +2049,19 @@ class HDMapGridAccumulator:
 
                 def _draw_bl_curve(center, left, right):
                     if center is not None and len(center) >= 2:
-                        set_model_color(model_floor_plane, 1.0, 0.55, 0.0, 1.0)
+                        set_model_color(identity, 1.0, 0.55, 0.0, 1.0)
                         glBegin(GL_LINE_STRIP)
                         for p in center:
                             glVertex3f(p[0], p[1], p[2] + z_lift)
                         glEnd()
                     if left is not None:
-                        set_model_color(model_floor_plane, 1.0, 0.82, 0.4, 1.0)
+                        set_model_color(identity, 1.0, 0.82, 0.4, 1.0)
                         glBegin(GL_LINE_STRIP)
                         for p in left:
                             glVertex3f(p[0], p[1], p[2] + z_lift)
                         glEnd()
                     if right is not None:
-                        set_model_color(model_floor_plane, 0.80, 0.35, 0.0, 1.0)
+                        set_model_color(identity, 0.80, 0.35, 0.0, 1.0)
                         glBegin(GL_LINE_STRIP)
                         for p in right:
                             glVertex3f(p[0], p[1], p[2] + z_lift)
