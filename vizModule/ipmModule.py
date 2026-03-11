@@ -580,7 +580,7 @@ class HDMapGridAccumulator:
     - Safe bounds handling
     """
     # Bike lanes and crosswalks stored/drawn this much above polygon plane to avoid z-fight under road
-    LAYER_OFFSET_ABOVE_POLYGON = 0.006
+    LAYER_OFFSET_ABOVE_POLYGON = 0.1
 
     def __init__(
         self,

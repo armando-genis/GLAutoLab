@@ -7,6 +7,7 @@ from OpenGL.GL import *
 import numpy as np
 import ctypes
 import math
+import time
 from pathlib import Path
 import imgui
 from imgui.integrations.glfw import GlfwRenderer
@@ -91,6 +92,11 @@ class SceneUI:
         self.pcd_point_size = 1.0   # scaled by ~20 in shader for visibility
         self.pcd_downsample = True
 
+        # Auto-play: advance scene every N seconds
+        self._auto_play_playing = False
+        self._auto_play_interval_sec = 6.0
+        self._auto_play_last_advance_time = 0.0
+
     def load_images_for_scene(self, idx):
         self._textures.clear()
         self._undistorted_images.clear()
@@ -136,6 +142,29 @@ class SceneUI:
             self._needs_reload = True
 
         imgui.text(f"Scene: {self.current_scene}")
+
+        # Auto-play: interval (seconds between scenes), Play, Stop
+        interval_changed, self._auto_play_interval_sec = imgui.slider_float(
+            "Auto-play interval (s)", self._auto_play_interval_sec, 0.5, 60.0, "%.1f"
+        )
+        if imgui.button("Play"):
+            self._auto_play_playing = True
+            self._auto_play_last_advance_time = time.time()
+        imgui.same_line()
+        if imgui.button("Stop"):
+            self._auto_play_playing = False
+        if self._auto_play_playing:
+            imgui.same_line()
+            imgui.text_colored("Auto-play ON", 0.2, 0.9, 0.2, 1.0)
+        # Advance scene when interval elapsed
+        if self._auto_play_playing and len(self.scene_indices) > 0:
+            now = time.time()
+            if (now - self._auto_play_last_advance_time) >= self._auto_play_interval_sec:
+                self._auto_play_last_advance_time = now
+                self.current_scene = min(len(self.scene_indices) - 1, self.current_scene + 1)
+                self._needs_reload = True
+                if self.current_scene >= len(self.scene_indices) - 1:
+                    self._auto_play_playing = False  # stop at end
 
         if imgui.button("Live Topic Trigger"):
             self._live_topic_mode = not self._live_topic_mode
@@ -729,12 +758,14 @@ class Viz:
         return out
 
     def _collect_hdmap_data(self) -> HDMapData:
-        """Snapshot current editable HD-map state into an HDMapData object."""
+        """Snapshot current editable HD-map state into an HDMapData object.
+        Polygon, centerline, bike-lane, and crosswalk z are saved as-is (JSON z used on load).
+        """
         acc = self._hd_grid_acc
         polygons_raw = [p.copy() for p in acc._polygons_editable] if acc._polygons_editable else []
         centerline = acc._centerline_pts.copy() if acc._centerline_pts is not None else None
-        # Elevate polygon vertices to centerline z so saved polygon follows terrain like centerline
-        polygons = self._elevate_polygons_to_centerline(polygons_raw, centerline)
+        # Save polygon z as-is so JSON stores actual vertex z (no elevation to centerline)
+        polygons = polygons_raw
         return HDMapData(
             polygons=polygons,
             centerline=centerline,
@@ -845,29 +876,40 @@ class Viz:
         return cam_pos, ray_world
 
     def _draw_ipm_layers(self, view: np.ndarray, proj: np.ndarray) -> None:
-        # Update polygon sphere positions to elevated (centerline z) so yellow spheres sit on the polygon line
-        if (self._ui.show_edit_polygon and self._polys and self._path_center is not None
-                and len(self._path_center) >= 2
+        # When map was loaded from JSON, use stored z (no elevation). Otherwise elevate to centerline.
+        use_json_z = self._ui._hdmap_from_json
+        # Update polygon sphere positions
+        if (self._ui.show_edit_polygon and self._polys
                 and not self._hd_grid_acc._polygon_spheres._dragging):
-            elevated = self._elevate_polygons_to_centerline(self._polys, self._path_center)
-            flat = [p for poly in elevated for p in poly]
+            if use_json_z:
+                flat = [p for poly in self._polys for p in poly]
+            else:
+                elevated = self._elevate_polygons_to_centerline(
+                    self._polys, self._path_center
+                ) if self._path_center is not None and len(self._path_center) >= 2 else self._polys
+                flat = [p for poly in elevated for p in poly]
             if flat:
                 self._hd_grid_acc._polygon_spheres.build_from_positions_direct(flat)
 
-        # Update bike lane sphere positions to elevated so they sit on the same plane as the polygon
-        if (self._ui.show_bike_lane and self._path_center is not None and len(self._path_center) >= 2
-                and self._hd_grid_acc._bike_lane_pts is not None and len(self._hd_grid_acc._bike_lane_pts) > 0
+        # Update bike lane sphere positions
+        if (self._ui.show_bike_lane
+                and self._hd_grid_acc._bike_lane_pts is not None
+                and len(self._hd_grid_acc._bike_lane_pts) > 0
                 and not self._hd_grid_acc._bike_lane_spheres._dragging):
-            elevated_bl = self._elevate_points_to_centerline(
-                self._hd_grid_acc._bike_lane_pts, self._path_center
-            )
-            if elevated_bl is not None and len(elevated_bl) > 0:
-                elevated_bl[:, 2] += self._hd_grid_acc.LAYER_OFFSET_ABOVE_POLYGON
-                self._hd_grid_acc._bike_lane_spheres.build_from_positions_direct(list(elevated_bl))
+            if use_json_z:
+                bl_pts = self._hd_grid_acc._bike_lane_pts.copy()
+                bl_pts[:, 2] += self._hd_grid_acc.LAYER_OFFSET_ABOVE_POLYGON
+                self._hd_grid_acc._bike_lane_spheres.build_from_positions_direct(list(bl_pts))
+            elif self._path_center is not None and len(self._path_center) >= 2:
+                elevated_bl = self._elevate_points_to_centerline(
+                    self._hd_grid_acc._bike_lane_pts, self._path_center
+                )
+                if elevated_bl is not None and len(elevated_bl) > 0:
+                    elevated_bl[:, 2] += self._hd_grid_acc.LAYER_OFFSET_ABOVE_POLYGON
+                    self._hd_grid_acc._bike_lane_spheres.build_from_positions_direct(list(elevated_bl))
 
-        # Update crosswalk sphere positions to elevated so they sit on the same plane as the polygon
-        if (self._ui.show_crosswalk and self._path_center is not None and len(self._path_center) >= 2
-                and not self._hd_grid_acc._crosswalk_spheres._dragging):
+        # Update crosswalk sphere positions
+        if (self._ui.show_crosswalk and not self._hd_grid_acc._crosswalk_spheres._dragging):
             cw_flat = []
             for cw in self._hd_grid_acc._crosswalk_pts:
                 cw_flat.append(cw[0])
@@ -875,11 +917,19 @@ class Viz:
             if self._hd_grid_acc._crosswalk_pending is not None:
                 cw_flat.append(self._hd_grid_acc._crosswalk_pending)
             if cw_flat:
-                elevated_cw = self._elevate_points_to_centerline(
-                    np.asarray(cw_flat, dtype=np.float32), self._path_center
-                )
-                elevated_cw[:, 2] += self._hd_grid_acc.LAYER_OFFSET_ABOVE_POLYGON
-                self._hd_grid_acc._crosswalk_spheres.build_from_positions_direct(list(elevated_cw))
+                if use_json_z:
+                    cw_arr = np.asarray(cw_flat, dtype=np.float32)
+                    if cw_arr.ndim == 1:
+                        cw_arr = cw_arr.reshape(-1, 3)
+                    cw_arr = cw_arr.copy()
+                    cw_arr[:, 2] += self._hd_grid_acc.LAYER_OFFSET_ABOVE_POLYGON
+                    self._hd_grid_acc._crosswalk_spheres.build_from_positions_direct(list(cw_arr))
+                elif self._path_center is not None and len(self._path_center) >= 2:
+                    elevated_cw = self._elevate_points_to_centerline(
+                        np.asarray(cw_flat, dtype=np.float32), self._path_center
+                    )
+                    elevated_cw[:, 2] += self._hd_grid_acc.LAYER_OFFSET_ABOVE_POLYGON
+                    self._hd_grid_acc._crosswalk_spheres.build_from_positions_direct(list(elevated_cw))
 
         self._hd_grid_acc.draw_all_layers(
             view, proj,

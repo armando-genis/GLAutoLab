@@ -445,7 +445,9 @@ def _crosswalk_rect(pt1: np.ndarray, pt2: np.ndarray,
     Compute the 4 corners of a crosswalk rectangle from its two end-centre
     points and the desired width.  Returns a (4, 3) float32 array ordered
     for ``GL_LINE_LOOP``, or ``None`` if the two points are degenerate.
-    If *polygons* is provided, z is taken from road surface at each corner (so crosswalk sits on street).
+    Z is taken from the JSON (pt1[2], pt2[2]) when present; otherwise from
+    road surface if *polygons* is provided, else 0. CROSSWALK_LIFT is added so
+    crosswalk draws on top.
     """
     dx = float(pt2[0] - pt1[0])
     dy = float(pt2[1] - pt1[1])
@@ -454,12 +456,16 @@ def _crosswalk_rect(pt1: np.ndarray, pt2: np.ndarray,
         return None
     rx, ry = -dy / L, dx / L          # unit vector perpendicular to the axis
     hw = width * 0.5
-    if polygons:
+    # Prefer z from JSON (endpoints); fall back to road surface only when endpoints lack z
+    if len(pt1) >= 3 and len(pt2) >= 3:
+        z1 = float(pt1[2]) + CROSSWALK_LIFT
+        z2 = float(pt2[2]) + CROSSWALK_LIFT
+    elif polygons:
         z1 = _road_z_at_xy(float(pt1[0]), float(pt1[1]), polygons, extra_lift=CROSSWALK_LIFT)
         z2 = _road_z_at_xy(float(pt2[0]), float(pt2[1]), polygons, extra_lift=CROSSWALK_LIFT)
     else:
-        z1 = float(pt1[2]) if len(pt1) >= 3 else 0.0
-        z2 = float(pt2[2]) if len(pt2) >= 3 else 0.0
+        z1 = 0.0
+        z2 = 0.0
     return np.array([
         [pt1[0] + rx * hw, pt1[1] + ry * hw, z1],
         [pt1[0] - rx * hw, pt1[1] - ry * hw, z1],
@@ -476,7 +482,9 @@ def _crosswalk_stripe_tris(pt1: np.ndarray, pt2: np.ndarray,
 
     Returns a (N, 3) float32 array where N is a multiple of 3 (GL_TRIANGLES),
     or ``None`` if the points are degenerate.
-    If *polygons* is provided, z is taken from road surface at each vertex (so crosswalk sits on street).
+    Z is taken from the JSON (pt1[2], pt2[2]) when present and interpolated
+    along the crosswalk; otherwise from road surface if *polygons* is provided.
+    CROSSWALK_LIFT is added so crosswalk draws on top.
     """
     dx = float(pt2[0] - pt1[0])
     dy = float(pt2[1] - pt1[1])
@@ -486,6 +494,12 @@ def _crosswalk_stripe_tris(pt1: np.ndarray, pt2: np.ndarray,
     ux, uy = dx / L, dy / L           # unit along crosswalk
     rx, ry = -dy / L, dx / L          # unit perpendicular
     hw = width * 0.5
+
+    # Base z from JSON when endpoints have z; else we use road or 0 per vertex
+    use_json_z = len(pt1) >= 3 and len(pt2) >= 3
+    if use_json_z:
+        z1_base = float(pt1[2]) + CROSSWALK_LIFT
+        z2_base = float(pt2[2]) + CROSSWALK_LIFT
 
     # 5 stripes minimum; add 1 per metre beyond 5 m (mirrors C++ / ipmModule logic)
     num_stripes = 5
@@ -501,7 +515,11 @@ def _crosswalk_stripe_tris(pt1: np.ndarray, pt2: np.ndarray,
         y0 = pt1[1] + uy * start_t
         x1 = pt1[0] + ux * end_t
         y1 = pt1[1] + uy * end_t
-        if polygons:
+        if use_json_z:
+            t0, t1 = start_t / L, end_t / L
+            z_start = (1.0 - t0) * z1_base + t0 * z2_base
+            z_end   = (1.0 - t1) * z1_base + t1 * z2_base
+        elif polygons:
             z_start = _road_z_at_xy(x0, y0, polygons, extra_lift=CROSSWALK_LIFT)
             z_end   = _road_z_at_xy(x1, y1, polygons, extra_lift=CROSSWALK_LIFT)
         else:
