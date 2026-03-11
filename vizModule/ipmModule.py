@@ -39,6 +39,8 @@ class IpmModule:
         # print(f"M: {self.M}")
 
         self.calculate_ipm()
+        # Max radius (m) for valid IPM region; beyond this, mask is invalid (reduces edge distortion)
+        self.ipm_max_radius_m = 6.0
         self.invalid_mask()
 
         self.mask_resolution = self.dataset.mask_resolution
@@ -117,6 +119,12 @@ class IpmModule:
         x_offset = i_grid - self.outputRes[1] / 2 + x_cam * self.pxPerM[1]
         theta = np.rad2deg(np.arctan2(y_offset, x_offset))
 
+        # Radial distance from camera in BEV (meters)
+        x_m = x_offset / self.pxPerM[1]
+        y_m = y_offset / self.pxPerM[0]
+        r_m = np.sqrt(x_m ** 2 + y_m ** 2)
+        outside_radius = r_m > self.ipm_max_radius_m
+
         self.masks = [None] * len(self.ipm_camera_configs)
 
         for i, config in enumerate(self.ipm_camera_configs):
@@ -127,7 +135,8 @@ class IpmModule:
             diff = (theta - yaw + 180) % 360 - 180
             diff = np.abs(diff)
 
-            mask_2d = diff > 90
+            # Invalid: outside angular FOV (diff > 90) OR beyond radial limit
+            mask_2d = (diff > 90) | outside_radius
             mask = np.stack([mask_2d, mask_2d, mask_2d], axis=-1)
 
             self.masks[i] = mask
@@ -622,11 +631,17 @@ class HDMapGridAccumulator:
         self._bld_pts: Optional[np.ndarray] = None   # active building polygon control pts (Nx3)
         self._bld_segments: list = []                # list of stored np.ndarray (Nx3), closed polygons
 
-        # Crosswalk spheres (white, draggable endpoint pairs)
+        # Crosswalk spheres (white, draggable; one sphere per corner)
         self._crosswalk_spheres = PathSphereMarkerRenderer(radius=0.20, color=(1.0, 1.0, 1.0, 0.9), drag_enabled=True)
-        self._crosswalk_pts: list = []               # list of (2,3) float32 arrays, one per crosswalk
-        self._crosswalk_pending: Optional[np.ndarray] = None  # first pt while awaiting second
+        self._crosswalk_pts: list = []               # list of (4,3) float32 arrays — four corners per crosswalk (GL_LINE_LOOP order)
+        self._crosswalk_pending: Optional[np.ndarray] = None  # first pt while awaiting second (two-phase placement)
         self._crosswalk_width: float = 3.0
+
+        # Parking car space spheres (yellow, draggable; one sphere per corner; rectangle like crosswalk)
+        self._parking_spheres = PathSphereMarkerRenderer(radius=0.20, color=(1.0, 0.9, 0.2, 0.9), drag_enabled=True)
+        self._parking_pts: list = []                  # list of (4,3) float32 arrays — four corners per parking space (GL_LINE_LOOP order)
+        self._parking_pending: Optional[np.ndarray] = None  # first pt while awaiting second (two-phase placement)
+        self._parking_width: float = 2.5             # width of parking rectangle (metres)
 
         # Bike-lane spheres (orange, independent of polygon / centerline)
         self._bike_lane_spheres = PathSphereMarkerRenderer(radius=0.15, color=(1.0, 0.55, 0.0, 0.9), drag_enabled=True)
@@ -1736,7 +1751,7 @@ class HDMapGridAccumulator:
         """
         Two-click crosswalk placement.
         First call stores the pending first point and returns False.
-        Second call creates the crosswalk, clears the pending point, returns True.
+        Second call creates the crosswalk as four corners (4,3), clears the pending point, returns True.
         world_point[2] is preserved (e.g. centerline elevation from caller).
         """
         p = np.array(world_point[:3], dtype=np.float32)
@@ -1747,8 +1762,8 @@ class HDMapGridAccumulator:
             self._rebuild_cw_spheres(include_pending=True)
             return False
         else:
-            cw = np.stack([self._crosswalk_pending, p], axis=0)
-            self._crosswalk_pts.append(cw)
+            corners = self._crosswalk_two_pts_to_corners(self._crosswalk_pending, p)
+            self._crosswalk_pts.append(corners)
             self._crosswalk_pending = None
             self._rebuild_cw_spheres(include_pending=False)
             return True
@@ -1758,9 +1773,9 @@ class HDMapGridAccumulator:
         idx = self._crosswalk_spheres._selected_index
         if idx < 0:
             return
-        pair_idx = idx // 2
-        if pair_idx < len(self._crosswalk_pts):
-            del self._crosswalk_pts[pair_idx]
+        cw_idx = idx // 4
+        if cw_idx < len(self._crosswalk_pts):
+            del self._crosswalk_pts[cw_idx]
         self._rebuild_cw_spheres(include_pending=False)
 
     def rebuild_crosswalk_spheres(self):
@@ -1771,75 +1786,81 @@ class HDMapGridAccumulator:
     def _rebuild_cw_spheres(self, include_pending: bool = False):
         pts = []
         for cw in self._crosswalk_pts:
-            pts.append(cw[0])
-            pts.append(cw[1])
+            pts.extend([cw[0], cw[1], cw[2], cw[3]])
         if include_pending and self._crosswalk_pending is not None:
             pts.append(self._crosswalk_pending)
         self._crosswalk_spheres.build_from_positions_direct(pts)
 
+    def _crosswalk_two_pts_to_corners(self, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+        """Build (4, 3) corners in GL_LINE_LOOP order from two centre-line endpoints and _crosswalk_width."""
+        p1 = np.asarray(p1, dtype=np.float64).ravel()[:3]
+        p2 = np.asarray(p2, dtype=np.float64).ravel()[:3]
+        if len(p1) < 3:
+            p1 = np.append(p1, 0.0)
+        if len(p2) < 3:
+            p2 = np.append(p2, 0.0)
+        dx, dy = float(p2[0] - p1[0]), float(p2[1] - p1[1])
+        L = np.sqrt(dx * dx + dy * dy)
+        if L < 1e-6:
+            L = 1e-6
+        hw = self._crosswalk_width * 0.5
+        rx, ry = -dy / L, dx / L
+        z1, z2 = float(p1[2]), float(p2[2])
+        return np.array([
+            [p1[0] + rx * hw, p1[1] + ry * hw, z1],
+            [p1[0] - rx * hw, p1[1] - ry * hw, z1],
+            [p2[0] - rx * hw, p2[1] - ry * hw, z2],
+            [p2[0] + rx * hw, p2[1] + ry * hw, z2],
+        ], dtype=np.float32)
+
     def get_crosswalk_corners(self) -> list:
         """
         Returns a list of (4, 3) float32 arrays – one per crosswalk.
-        Corners are ordered for GL_LINE_LOOP.
+        Corners are stored and ordered for GL_LINE_LOOP.
         """
-        result = []
-        hw = self._crosswalk_width * 0.5
-        for cw in self._crosswalk_pts:
-            p1, p2 = cw[0], cw[1]
-            dx, dy = float(p2[0] - p1[0]), float(p2[1] - p1[1])
-            L = np.sqrt(dx * dx + dy * dy)
-            if L < 1e-6:
-                continue
-            rx, ry = -dy / L, dx / L
-            result.append(np.array([
-                [p1[0] + rx * hw, p1[1] + ry * hw, 0.0],
-                [p1[0] - rx * hw, p1[1] - ry * hw, 0.0],
-                [p2[0] - rx * hw, p2[1] - ry * hw, 0.0],
-                [p2[0] + rx * hw, p2[1] + ry * hw, 0.0],
-            ], dtype=np.float32))
-        return result
+        return [np.asarray(cw, dtype=np.float32).copy() for cw in self._crosswalk_pts]
 
     def get_crosswalk_stripe_tris(self) -> list:
         """
         Returns a list of (N, 3) float32 arrays of triangle vertices (N % 3 == 0),
-        one array per crosswalk, representing zebra stripes across the crosswalk.
+        one array per crosswalk, representing zebra stripes. Derived from stored four corners.
         """
         z_offset = 0.07
         result = []
-        hw = self._crosswalk_width * 0.5
         for cw in self._crosswalk_pts:
-            p1 = cw[0].astype(np.float64)
-            p2 = cw[1].astype(np.float64)
+            cw = np.asarray(cw, dtype=np.float64)
+            if cw.shape != (4, 3):
+                continue
+            # Corners order: [p1+rw, p1-rw, p2-rw, p2+rw]; centreline p1=(c0+c1)/2, p2=(c2+c3)/2
+            p1 = (cw[0] + cw[1]) * 0.5
+            p2 = (cw[2] + cw[3]) * 0.5
             dx, dy = p2[0] - p1[0], p2[1] - p1[1]
             L = np.sqrt(dx * dx + dy * dy)
             if L < 1e-6:
                 continue
-            # unit vectors: along and perpendicular to crosswalk direction
+            hw = 0.5 * np.sqrt(np.sum((cw[0] - cw[1]) ** 2))
             ux, uy = dx / L, dy / L
             rx, ry = -dy / L, dx / L
 
-            # Match C++ formula: start with 5 stripes, add 1 per metre beyond 5 m
             num_stripes = 5
             if L > 5.0:
                 num_stripes += int((L - 5.0) / 1.0)
 
             stripe_length = L / (2 * num_stripes)
             tris: list = []
+            z1_avg = float((cw[0, 2] + cw[1, 2]) * 0.5) + z_offset
+            z2_avg = float((cw[2, 2] + cw[3, 2]) * 0.5) + z_offset
             for stripe_idx in range(num_stripes):
                 start_t = stripe_idx * 2 * stripe_length
                 end_t   = start_t + stripe_length
+                t0, t1 = start_t / L, end_t / L
+                z_start = (1.0 - t0) * z1_avg + t0 * z2_avg
+                z_end   = (1.0 - t1) * z1_avg + t1 * z2_avg
 
-                # Four corners of the stripe rectangle
-                c0 = np.array([ p1[0] + ux * start_t + rx * hw,
-                                 p1[1] + uy * start_t + ry * hw, z_offset], dtype=np.float32)
-                c1 = np.array([ p1[0] + ux * start_t - rx * hw,
-                                 p1[1] + uy * start_t - ry * hw, z_offset], dtype=np.float32)
-                c2 = np.array([ p1[0] + ux * end_t   - rx * hw,
-                                 p1[1] + uy * end_t   - ry * hw, z_offset], dtype=np.float32)
-                c3 = np.array([ p1[0] + ux * end_t   + rx * hw,
-                                 p1[1] + uy * end_t   + ry * hw, z_offset], dtype=np.float32)
-
-                # Fan-triangulate the quad (two triangles)
+                c0 = np.array([p1[0] + ux * start_t + rx * hw, p1[1] + uy * start_t + ry * hw, z_start], dtype=np.float32)
+                c1 = np.array([p1[0] + ux * start_t - rx * hw, p1[1] + uy * start_t - ry * hw, z_start], dtype=np.float32)
+                c2 = np.array([p1[0] + ux * end_t   - rx * hw, p1[1] + uy * end_t   - ry * hw, z_end], dtype=np.float32)
+                c3 = np.array([p1[0] + ux * end_t   + rx * hw, p1[1] + uy * end_t   + ry * hw, z_end], dtype=np.float32)
                 tris.extend([c0, c1, c2, c0, c2, c3])
 
             if tris:
@@ -1848,17 +1869,104 @@ class HDMapGridAccumulator:
 
     def sync_crosswalk_sphere(self, sphere_index: int):
         """Commit the current 3-D position of a moved sphere back to _crosswalk_pts (above polygon plane)."""
-        pair_idx = sphere_index // 2
-        pt_idx   = sphere_index % 2
-        if pair_idx >= len(self._crosswalk_pts):
+        cw_idx   = sphere_index // 4
+        corner_idx = sphere_index % 4
+        if cw_idx >= len(self._crosswalk_pts):
             return
         pos = self._crosswalk_spheres._centers[sphere_index].copy()
         pos[2] -= getattr(self._crosswalk_spheres, "sphere_height", 0.40)
         pos[2] += self.LAYER_OFFSET_ABOVE_POLYGON
-        self._crosswalk_pts[pair_idx][pt_idx] = pos
+        self._crosswalk_pts[cw_idx][corner_idx] = pos
 
     def draw_crosswalk_spheres(self, view: np.ndarray, projection: np.ndarray, model: np.ndarray = None):
         self._crosswalk_spheres.draw(view, projection, model=model)
+
+    # --------------------------------------------------
+    # Parking car space (rectangle) add / erase / draw
+    # --------------------------------------------------
+
+    def add_parking_point(self, world_point) -> bool:
+        """
+        Two-click parking space placement.
+        First call stores the pending first point and returns False.
+        Second call creates the parking rectangle as four corners (4,3), clears the pending point, returns True.
+        """
+        p = np.array(world_point[:3], dtype=np.float32)
+        if len(p) < 3:
+            p = np.append(p, 0.0)
+        if self._parking_pending is None:
+            self._parking_pending = p
+            self._rebuild_parking_spheres(include_pending=True)
+            return False
+        else:
+            corners = self._parking_two_pts_to_corners(self._parking_pending, p)
+            self._parking_pts.append(corners)
+            self._parking_pending = None
+            self._rebuild_parking_spheres(include_pending=False)
+            return True
+
+    def erase_selected_parking(self):
+        """Remove the parking space whose sphere is currently selected."""
+        idx = self._parking_spheres._selected_index
+        if idx < 0:
+            return
+        pk_idx = idx // 4
+        if pk_idx < len(self._parking_pts):
+            del self._parking_pts[pk_idx]
+        self._rebuild_parking_spheres(include_pending=False)
+
+    def rebuild_parking_spheres(self):
+        """Rebuild sphere renderer (clears any pending point)."""
+        self._parking_pending = None
+        self._rebuild_parking_spheres(include_pending=False)
+
+    def _rebuild_parking_spheres(self, include_pending: bool = False):
+        pts = []
+        for pk in self._parking_pts:
+            pts.extend([pk[0], pk[1], pk[2], pk[3]])
+        if include_pending and self._parking_pending is not None:
+            pts.append(self._parking_pending)
+        self._parking_spheres.build_from_positions_direct(pts)
+
+    def _parking_two_pts_to_corners(self, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+        """Build (4, 3) corners in GL_LINE_LOOP order from two centre-line endpoints and _parking_width."""
+        p1 = np.asarray(p1, dtype=np.float64).ravel()[:3]
+        p2 = np.asarray(p2, dtype=np.float64).ravel()[:3]
+        if len(p1) < 3:
+            p1 = np.append(p1, 0.0)
+        if len(p2) < 3:
+            p2 = np.append(p2, 0.0)
+        dx, dy = float(p2[0] - p1[0]), float(p2[1] - p1[1])
+        L = np.sqrt(dx * dx + dy * dy)
+        if L < 1e-6:
+            L = 1e-6
+        hw = self._parking_width * 0.5
+        rx, ry = -dy / L, dx / L
+        z1, z2 = float(p1[2]), float(p2[2])
+        return np.array([
+            [p1[0] + rx * hw, p1[1] + ry * hw, z1],
+            [p1[0] - rx * hw, p1[1] - ry * hw, z1],
+            [p2[0] - rx * hw, p2[1] - ry * hw, z2],
+            [p2[0] + rx * hw, p2[1] + ry * hw, z2],
+        ], dtype=np.float32)
+
+    def get_parking_corners(self) -> list:
+        """Returns a list of (4, 3) float32 arrays – one per parking space (GL_LINE_LOOP order)."""
+        return [np.asarray(pk, dtype=np.float32).copy() for pk in self._parking_pts]
+
+    def sync_parking_sphere(self, sphere_index: int):
+        """Commit the current 3-D position of a moved sphere back to _parking_pts."""
+        pk_idx = sphere_index // 4
+        corner_idx = sphere_index % 4
+        if pk_idx >= len(self._parking_pts):
+            return
+        pos = self._parking_spheres._centers[sphere_index].copy()
+        pos[2] -= getattr(self._parking_spheres, "sphere_height", 0.40)
+        pos[2] += self.LAYER_OFFSET_ABOVE_POLYGON
+        self._parking_pts[pk_idx][corner_idx] = pos
+
+    def draw_parking_spheres(self, view: np.ndarray, projection: np.ndarray, model: np.ndarray = None):
+        self._parking_spheres.draw(view, projection, model=model)
 
     def draw_bike_lane_spheres(self, view: np.ndarray, projection: np.ndarray, model: np.ndarray = None):
         self._bike_lane_spheres.draw(view, projection, model=model)
@@ -1880,9 +1988,10 @@ class HDMapGridAccumulator:
                         show_hdmap_texture: bool,
                         show_bike_lane: bool,
                         show_buildings: bool,
-                        show_crosswalk: bool) -> None:
+                        show_crosswalk: bool,
+                        show_parking: bool) -> None:
         """Draw every IPM layer: live BEV plane, accumulated HD grid, polygon/sphere/
-        ribbon overlays, buildings, crosswalks, centerline and bike-lane lines.
+        ribbon overlays, buildings, crosswalks, parking spaces, centerline and bike-lane lines.
         Polygon is elevated to centerline z so it aligns with the blue path; all
         drawn in world space (identity) so spheres and ray hit-test match."""
         identity = np.identity(4, dtype=np.float32)
@@ -2022,6 +2131,24 @@ class HDMapGridAccumulator:
                             glVertex3f(float(v[0]), float(v[1]), float(v[2]))
                         glEnd()
                 self.draw_crosswalk_spheres(view.T, proj.T, model=identity.T)
+                glUseProgram(program)
+
+            if show_parking:
+                corners_list = self.get_parking_corners()
+                if corners_list:
+                    glUseProgram(program)
+                    set_model_color(identity, 1.0, 0.9, 0.2, 1.0)
+                    glLineWidth(2.5)
+                    for corners in corners_list:
+                        if path_center is not None and len(path_center) >= 2:
+                            corners = _elevate_pts_to_centerline(corners, path_center)
+                            corners[:, 2] += self.LAYER_OFFSET_ABOVE_POLYGON
+                        glBegin(GL_LINE_LOOP)
+                        for c in corners:
+                            glVertex3f(float(c[0]), float(c[1]), float(c[2]) + 0.07)
+                        glEnd()
+                    glLineWidth(1.0)
+                self.draw_parking_spheres(view.T, proj.T, model=identity.T)
                 glUseProgram(program)
 
             if path_center is not None and len(path_center) >= 2:

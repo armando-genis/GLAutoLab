@@ -147,8 +147,10 @@ class HDMapData:
     bike_lane_segments: List[np.ndarray] = field(default_factory=list)
     bike_lane_active: Optional[np.ndarray] = None
     bike_lane_width: float = 1.5
-    crosswalks: List[np.ndarray] = field(default_factory=list)  # each (2, 3): [pt1, pt2]
+    crosswalks: List[np.ndarray] = field(default_factory=list)  # each (2, 3) [pt1, pt2] or (4, 3) four corners
     crosswalk_width: float = 3.0
+    parking_spaces: List[np.ndarray] = field(default_factory=list)  # each (4, 3) four corners per parking rectangle
+    parking_width: float = 2.5
     buildings: List[np.ndarray] = field(default_factory=list)   # each (N, 3): closed polygon pts
 
 
@@ -209,6 +211,8 @@ class HDMapIO:
             "bike_lane_width": float(data.bike_lane_width),
             "crosswalks": [_arr_to_list(c) for c in data.crosswalks],
             "crosswalk_width": float(data.crosswalk_width),
+            "parking_spaces": [_arr_to_list(p) for p in data.parking_spaces],
+            "parking_width": float(data.parking_width),
             "buildings": [_arr_to_list(b) for b in data.buildings],
         }
         path = Path(filepath)
@@ -260,6 +264,12 @@ class HDMapIO:
                 if c is not None
             ],
             crosswalk_width=float(payload.get("crosswalk_width", 3.0)),
+            parking_spaces=[
+                _ensure_3d(_list_to_arr(p))
+                for p in payload.get("parking_spaces", [])
+                if p is not None
+            ],
+            parking_width=float(payload.get("parking_width", 2.5)),
             buildings=[
                 _ensure_3d(_list_to_arr(b))
                 for b in payload.get("buildings", [])
@@ -281,6 +291,7 @@ class HDMapIO:
             f"bike_lane={n_bl_segs}segs+{n_bl_active}active  "
             f"width={data.bike_lane_width:.2f}m  "
             f"crosswalks={len(data.crosswalks)}  "
+            f"parking_spaces={len(data.parking_spaces)}  "
             f"buildings={len(data.buildings)}"
         )
 
@@ -415,9 +426,11 @@ def _offset_polygon_outward(pts_2d: np.ndarray, offset: float,
     return result
 
 
-# Road surface z = poly vertex z + ROAD_LIFT. Crosswalks use road z + CROSSWALK_LIFT so they draw on top.
+# Road surface z = poly vertex z + ROAD_LIFT. Crosswalks/bike lanes use road z + LAYER_OFFSET_ABOVE_POLYGON
+# so they draw clearly above the street polygon (same as ipmModule; avoids z-fighting).
 ROAD_LIFT = 0.001
-CROSSWALK_LIFT = 0.004   # crosswalk geometry sits this much above road to avoid z-fighting and clipping
+CROSSWALK_LIFT = 0.004   # legacy; draw path uses LAYER_OFFSET_ABOVE_POLYGON
+LAYER_OFFSET_ABOVE_POLYGON = 0.1   # crosswalk and bike-lane geometry this much above road plane
 
 
 def _road_z_at_xy(x: float, y: float, polygons: list, road_lift: float = 0.001,
@@ -446,8 +459,8 @@ def _crosswalk_rect(pt1: np.ndarray, pt2: np.ndarray,
     points and the desired width.  Returns a (4, 3) float32 array ordered
     for ``GL_LINE_LOOP``, or ``None`` if the two points are degenerate.
     Z is taken from the JSON (pt1[2], pt2[2]) when present; otherwise from
-    road surface if *polygons* is provided, else 0. CROSSWALK_LIFT is added so
-    crosswalk draws on top.
+    road surface if *polygons* is provided, else 0. LAYER_OFFSET_ABOVE_POLYGON
+    is added so crosswalk draws clearly above the street polygon.
     """
     dx = float(pt2[0] - pt1[0])
     dy = float(pt2[1] - pt1[1])
@@ -458,14 +471,14 @@ def _crosswalk_rect(pt1: np.ndarray, pt2: np.ndarray,
     hw = width * 0.5
     # Prefer z from JSON (endpoints); fall back to road surface only when endpoints lack z
     if len(pt1) >= 3 and len(pt2) >= 3:
-        z1 = float(pt1[2]) + CROSSWALK_LIFT
-        z2 = float(pt2[2]) + CROSSWALK_LIFT
+        z1 = float(pt1[2]) + LAYER_OFFSET_ABOVE_POLYGON
+        z2 = float(pt2[2]) + LAYER_OFFSET_ABOVE_POLYGON
     elif polygons:
-        z1 = _road_z_at_xy(float(pt1[0]), float(pt1[1]), polygons, extra_lift=CROSSWALK_LIFT)
-        z2 = _road_z_at_xy(float(pt2[0]), float(pt2[1]), polygons, extra_lift=CROSSWALK_LIFT)
+        z1 = _road_z_at_xy(float(pt1[0]), float(pt1[1]), polygons, extra_lift=LAYER_OFFSET_ABOVE_POLYGON)
+        z2 = _road_z_at_xy(float(pt2[0]), float(pt2[1]), polygons, extra_lift=LAYER_OFFSET_ABOVE_POLYGON)
     else:
-        z1 = 0.0
-        z2 = 0.0
+        z1 = 0.0 + LAYER_OFFSET_ABOVE_POLYGON
+        z2 = 0.0 + LAYER_OFFSET_ABOVE_POLYGON
     return np.array([
         [pt1[0] + rx * hw, pt1[1] + ry * hw, z1],
         [pt1[0] - rx * hw, pt1[1] - ry * hw, z1],
@@ -484,7 +497,7 @@ def _crosswalk_stripe_tris(pt1: np.ndarray, pt2: np.ndarray,
     or ``None`` if the points are degenerate.
     Z is taken from the JSON (pt1[2], pt2[2]) when present and interpolated
     along the crosswalk; otherwise from road surface if *polygons* is provided.
-    CROSSWALK_LIFT is added so crosswalk draws on top.
+    LAYER_OFFSET_ABOVE_POLYGON is added so crosswalk draws clearly above the street polygon.
     """
     dx = float(pt2[0] - pt1[0])
     dy = float(pt2[1] - pt1[1])
@@ -498,8 +511,8 @@ def _crosswalk_stripe_tris(pt1: np.ndarray, pt2: np.ndarray,
     # Base z from JSON when endpoints have z; else we use road or 0 per vertex
     use_json_z = len(pt1) >= 3 and len(pt2) >= 3
     if use_json_z:
-        z1_base = float(pt1[2]) + CROSSWALK_LIFT
-        z2_base = float(pt2[2]) + CROSSWALK_LIFT
+        z1_base = float(pt1[2]) + LAYER_OFFSET_ABOVE_POLYGON
+        z2_base = float(pt2[2]) + LAYER_OFFSET_ABOVE_POLYGON
 
     # 5 stripes minimum; add 1 per metre beyond 5 m (mirrors C++ / ipmModule logic)
     num_stripes = 5
@@ -520,14 +533,14 @@ def _crosswalk_stripe_tris(pt1: np.ndarray, pt2: np.ndarray,
             z_start = (1.0 - t0) * z1_base + t0 * z2_base
             z_end   = (1.0 - t1) * z1_base + t1 * z2_base
         elif polygons:
-            z_start = _road_z_at_xy(x0, y0, polygons, extra_lift=CROSSWALK_LIFT)
-            z_end   = _road_z_at_xy(x1, y1, polygons, extra_lift=CROSSWALK_LIFT)
+            z_start = _road_z_at_xy(x0, y0, polygons, extra_lift=LAYER_OFFSET_ABOVE_POLYGON)
+            z_end   = _road_z_at_xy(x1, y1, polygons, extra_lift=LAYER_OFFSET_ABOVE_POLYGON)
         else:
             z1 = float(pt1[2]) if len(pt1) >= 3 else 0.0
             z2 = float(pt2[2]) if len(pt2) >= 3 else 0.0
             t0, t1 = start_t / L, end_t / L
-            z_start = (1.0 - t0) * z1 + t0 * z2
-            z_end   = (1.0 - t1) * z1 + t1 * z2
+            z_start = (1.0 - t0) * z1 + t0 * z2 + LAYER_OFFSET_ABOVE_POLYGON
+            z_end   = (1.0 - t1) * z1 + t1 * z2 + LAYER_OFFSET_ABOVE_POLYGON
 
         c0 = [x0 + rx * hw, y0 + ry * hw, z_start]
         c1 = [x0 - rx * hw, y0 - ry * hw, z_start]
@@ -863,8 +876,9 @@ class HDMapRenderer:
             if seg is None or len(seg) < 2:
                 continue
             smooth = _catmull_rom_open(seg)
+            # Same as ipmModule: draw bike lane above polygon plane to avoid z-fight with street
             pts = [
-                np.array([p[0], p[1], p[2] if len(p) >= 3 else self.lane_z], dtype=np.float32)
+                np.array([p[0], p[1], (p[2] if len(p) >= 3 else 0.0) + LAYER_OFFSET_ABOVE_POLYGON], dtype=np.float32)
                 for p in smooth
             ]
             ribbon = PosePathRenderer(width=self.bl_width, outlined=True)
@@ -1091,12 +1105,24 @@ class HDMapRenderer:
 
         cw_width = data.crosswalk_width
         for cw in data.crosswalks:
-            if cw is None or np.asarray(cw).shape != (2, 3):
+            if cw is None:
                 continue
             cw = np.asarray(cw, dtype=np.float32)
 
-            # Outline — snap z to road surface so crosswalk sits on street
-            corners = _crosswalk_rect(cw[0], cw[1], cw_width, polygons=data.polygons)
+            if cw.shape == (4, 3):
+                # Stored as four corners — use directly for outline; derive pt1, pt2, width for stripes
+                corners = cw
+                pt1 = (cw[0] + cw[1]) * 0.5
+                pt2 = (cw[2] + cw[3]) * 0.5
+                width = float(np.linalg.norm(cw[0] - cw[1]))
+                stripe_verts = _crosswalk_stripe_tris(pt1, pt2, width, polygons=data.polygons)
+            elif cw.shape == (2, 3):
+                # Legacy two-point format — compute corners and stripes from endpoints
+                corners = _crosswalk_rect(cw[0], cw[1], cw_width, polygons=data.polygons)
+                stripe_verts = _crosswalk_stripe_tris(cw[0], cw[1], cw_width, polygons=data.polygons)
+            else:
+                continue
+
             if corners is not None:
                 vao = glGenVertexArrays(1)
                 vbo = glGenBuffers(1)
@@ -1108,8 +1134,6 @@ class HDMapRenderer:
                 glBindVertexArray(0)
                 self._cw_geom.append((int(vao), int(vbo), 4))
 
-            # Zebra stripes — snap z to road surface so crosswalk sits on street
-            stripe_verts = _crosswalk_stripe_tris(cw[0], cw[1], cw_width, polygons=data.polygons)
             if stripe_verts is not None:
                 vao = glGenVertexArrays(1)
                 vbo = glGenBuffers(1)

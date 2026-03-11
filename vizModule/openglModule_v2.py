@@ -74,6 +74,10 @@ class SceneUI:
         self.show_crosswalk = False
         self.crosswalk_width = 3.0   # metres
 
+        self._parking_mode = None    # None | "add" | "erase"
+        self.show_parking = False
+        self.parking_width = 2.5     # metres
+
         self._building_mode = None   # None | "add" | "erase"
         self.show_buildings = False
 
@@ -384,6 +388,38 @@ class SceneUI:
 
             # crosswalk pending indicator
             if self._crosswalk_mode == "add":
+                imgui.text_colored("Click map: pt 1 (then pt 2)", 1.0, 0.9, 0.2, 1.0)
+
+            # ── Parking car spaces ──────────────────────────────────────────
+            imgui.separator()
+            imgui.text("Parking Spaces")
+
+            _, self.show_parking = imgui.checkbox("Show Parking", self.show_parking)
+
+            pk_w_changed, pk_w_new = imgui.slider_float("Parking Width (m)", self.parking_width, 1.0, 8.0)
+            if pk_w_changed:
+                self.parking_width = pk_w_new
+
+            if imgui.button("Add Parking"):
+                self._parking_mode = "add"
+                self._polygon_mode = None
+                self._centerline_mode = None
+                self._bike_lane_mode = None
+                self._crosswalk_mode = None
+
+            imgui.same_line()
+
+            if imgui.button("Erase Parking"):
+                self._parking_mode = "erase"
+                self._polygon_mode = None
+                self._centerline_mode = None
+                self._bike_lane_mode = None
+                self._crosswalk_mode = None
+
+            if imgui.button("Clear All Parking"):
+                self._parking_mode = "clear_parking"
+
+            if self._parking_mode == "add":
                 imgui.text_colored("Click map: pt 1 (then pt 2)", 1.0, 0.9, 0.2, 1.0)
 
             # ── Render loaded snapshot ───────────────────────────────────────
@@ -774,6 +810,8 @@ class Viz:
             bike_lane_width=float(self._ui.bike_lane_width),
             crosswalks=[c.copy() for c in acc._crosswalk_pts],
             crosswalk_width=float(self._ui.crosswalk_width),
+            parking_spaces=[p.copy() for p in acc._parking_pts],
+            parking_width=float(self._ui.parking_width),
             buildings=[s.copy() for s in acc._bld_segments] +
                       ([acc._bld_pts.copy()] if acc._bld_pts is not None and len(acc._bld_pts) >= 3 else []),
         )
@@ -834,17 +872,39 @@ class Viz:
         if data.bike_lane_segments or data.bike_lane_active is not None:
             self._ui.show_bike_lane = True
 
-        # ── Crosswalks ────────────────────────────────────────────────────
-        acc._crosswalk_pts = [
-            c.copy() for c in data.crosswalks
-            if c is not None and np.asarray(c).shape == (2, 3)
-        ]
+        # ── Crosswalks (store as four corners per crosswalk; accept (4,3) or (2,3) from JSON) ──
+        acc._crosswalk_width = data.crosswalk_width
+        acc._crosswalk_pts = []
+        for c in data.crosswalks or []:
+            if c is None:
+                continue
+            c = np.asarray(c, dtype=np.float32)
+            if c.shape == (4, 3):
+                acc._crosswalk_pts.append(c.copy())
+            elif c.shape == (2, 3):
+                acc._crosswalk_pts.append(acc._crosswalk_two_pts_to_corners(c[0], c[1]))
         acc._crosswalk_pending = None
         acc.rebuild_crosswalk_spheres()
-        acc._crosswalk_width = data.crosswalk_width
         self._ui.crosswalk_width = data.crosswalk_width
         if acc._crosswalk_pts:
             self._ui.show_crosswalk = True
+
+        # ── Parking spaces (four corners per space; accept (4,3) or (2,3) from JSON) ──
+        acc._parking_width = data.parking_width
+        acc._parking_pts = []
+        for p in data.parking_spaces or []:
+            if p is None:
+                continue
+            p = np.asarray(p, dtype=np.float32)
+            if p.shape == (4, 3):
+                acc._parking_pts.append(p.copy())
+            elif p.shape == (2, 3):
+                acc._parking_pts.append(acc._parking_two_pts_to_corners(p[0], p[1]))
+        acc._parking_pending = None
+        acc.rebuild_parking_spheres()
+        self._ui.parking_width = data.parking_width
+        if acc._parking_pts:
+            self._ui.show_parking = True
 
         # ── Buildings ────────────────────────────────────────────────────
         acc._bld_segments = [
@@ -908,12 +968,11 @@ class Viz:
                     elevated_bl[:, 2] += self._hd_grid_acc.LAYER_OFFSET_ABOVE_POLYGON
                     self._hd_grid_acc._bike_lane_spheres.build_from_positions_direct(list(elevated_bl))
 
-        # Update crosswalk sphere positions
+        # Update crosswalk sphere positions (four corners per crosswalk)
         if (self._ui.show_crosswalk and not self._hd_grid_acc._crosswalk_spheres._dragging):
             cw_flat = []
             for cw in self._hd_grid_acc._crosswalk_pts:
-                cw_flat.append(cw[0])
-                cw_flat.append(cw[1])
+                cw_flat.extend([cw[0], cw[1], cw[2], cw[3]])
             if self._hd_grid_acc._crosswalk_pending is not None:
                 cw_flat.append(self._hd_grid_acc._crosswalk_pending)
             if cw_flat:
@@ -930,6 +989,28 @@ class Viz:
                     )
                     elevated_cw[:, 2] += self._hd_grid_acc.LAYER_OFFSET_ABOVE_POLYGON
                     self._hd_grid_acc._crosswalk_spheres.build_from_positions_direct(list(elevated_cw))
+
+        # Update parking sphere positions (four corners per parking space)
+        if (self._ui.show_parking and not self._hd_grid_acc._parking_spheres._dragging):
+            pk_flat = []
+            for pk in self._hd_grid_acc._parking_pts:
+                pk_flat.extend([pk[0], pk[1], pk[2], pk[3]])
+            if self._hd_grid_acc._parking_pending is not None:
+                pk_flat.append(self._hd_grid_acc._parking_pending)
+            if pk_flat:
+                if use_json_z:
+                    pk_arr = np.asarray(pk_flat, dtype=np.float32)
+                    if pk_arr.ndim == 1:
+                        pk_arr = pk_arr.reshape(-1, 3)
+                    pk_arr = pk_arr.copy()
+                    pk_arr[:, 2] += self._hd_grid_acc.LAYER_OFFSET_ABOVE_POLYGON
+                    self._hd_grid_acc._parking_spheres.build_from_positions_direct(list(pk_arr))
+                elif self._path_center is not None and len(self._path_center) >= 2:
+                    elevated_pk = self._elevate_points_to_centerline(
+                        np.asarray(pk_flat, dtype=np.float32), self._path_center
+                    )
+                    elevated_pk[:, 2] += self._hd_grid_acc.LAYER_OFFSET_ABOVE_POLYGON
+                    self._hd_grid_acc._parking_spheres.build_from_positions_direct(list(elevated_pk))
 
         self._hd_grid_acc.draw_all_layers(
             view, proj,
@@ -955,6 +1036,7 @@ class Viz:
             show_bike_lane=self._ui.show_bike_lane,
             show_buildings=self._ui.show_buildings,
             show_crosswalk=self._ui.show_crosswalk,
+            show_parking=self._ui.show_parking,
         )
 
     def run(self):
@@ -1029,6 +1111,16 @@ class Viz:
                 self._hd_grid_acc._crosswalk_pts = []
                 self._hd_grid_acc.rebuild_crosswalk_spheres()
                 self._ui._crosswalk_mode = None
+
+            # Handle parking width slider
+            if self._ui.show_parking and self._ui.parking_width != self._hd_grid_acc._parking_width:
+                self._hd_grid_acc._parking_width = self._ui.parking_width
+
+            # Handle "Clear All Parking"
+            if self._ui._parking_mode == "clear_parking":
+                self._hd_grid_acc._parking_pts = []
+                self._hd_grid_acc.rebuild_parking_spheres()
+                self._ui._parking_mode = None
 
             # Handle HD-map save / load requests
             if self._ui._hdmap_save_requested:
@@ -1134,6 +1226,11 @@ class Viz:
                             if cw_res is not None and cw_res[1] < best_t:
                                 best_t = cw_res[1]; best_kind = "crosswalk"; best_idx = cw_res[0]
 
+                        if self._ui.show_parking:
+                            pk_res = self._hd_grid_acc._parking_spheres.intersect_ray(cam_pos, ray_dir)
+                            if pk_res is not None and pk_res[1] < best_t:
+                                best_t = pk_res[1]; best_kind = "parking"; best_idx = pk_res[0]
+
                         if self._ui.show_buildings:
                             bld_res = self._hd_grid_acc._bld_spheres.intersect_ray(cam_pos_m, ray_dir_m)
                             if bld_res is not None and bld_res[1] < best_t:
@@ -1151,6 +1248,9 @@ class Viz:
                         elif best_kind == "crosswalk":
                             self._hd_grid_acc._crosswalk_spheres.select(best_idx)
                             self._hd_grid_acc._crosswalk_spheres.begin_drag(cam_pos, ray_dir)
+                        elif best_kind == "parking":
+                            self._hd_grid_acc._parking_spheres.select(best_idx)
+                            self._hd_grid_acc._parking_spheres.begin_drag(cam_pos, ray_dir)
                         elif best_kind == "building":
                             self._hd_grid_acc._bld_spheres.select(best_idx)
                             self._hd_grid_acc._bld_spheres.begin_drag(cam_pos_m, ray_dir_m)
@@ -1326,6 +1426,32 @@ class Viz:
 
                                     handled_polygon_mode = True
 
+                                # Parking add / erase
+                                pk_mode = self._ui._parking_mode
+                                if pk_mode is not None and self._ui.show_parking and pk_mode in ("add", "erase"):
+                                    if pk_mode == "add":
+                                        if abs(ray_dir[2]) > 1e-6:
+                                            t_gnd = -cam_pos[2] / ray_dir[2]
+                                            hit = cam_pos + t_gnd * ray_dir
+                                        else:
+                                            hit = None
+                                        if hit is not None:
+                                            if self._path_center is not None and len(self._path_center) >= 2:
+                                                cl_xy = np.asarray(self._path_center)[:, :2].astype(np.float64)
+                                                cl_z = np.asarray(self._path_center)[:, 2]
+                                                d2 = np.sum((cl_xy - np.array([hit[0], hit[1]], dtype=np.float64)) ** 2, axis=1)
+                                                hit[2] = float(cl_z[np.argmin(d2)]) + self._hd_grid_acc.LAYER_OFFSET_ABOVE_POLYGON
+                                            completed = self._hd_grid_acc.add_parking_point(hit)
+                                            if completed:
+                                                self._ui._parking_mode = None
+                                    elif pk_mode == "erase":
+                                        pk_res = self._hd_grid_acc._parking_spheres.intersect_ray(cam_pos, ray_dir)
+                                        if pk_res is not None:
+                                            self._hd_grid_acc._parking_spheres.select(pk_res[0])
+                                            self._hd_grid_acc.erase_selected_parking()
+                                        self._ui._parking_mode = None
+                                    handled_polygon_mode = True
+
                             if not handled_polygon_mode:
 
                                 # bring ray into lidar frame so label.intersect_ray works correctly
@@ -1380,6 +1506,10 @@ class Viz:
                         was_cw_dragging = self._hd_grid_acc._crosswalk_spheres._dragging
                         self._hd_grid_acc._crosswalk_spheres.end_drag()
 
+                        pk_drag_idx = self._hd_grid_acc._parking_spheres._selected_index
+                        was_pk_dragging = self._hd_grid_acc._parking_spheres._dragging
+                        self._hd_grid_acc._parking_spheres.end_drag()
+
                         bld_drag_idx = self._hd_grid_acc._bld_spheres._selected_index
                         was_bld_dragging = self._hd_grid_acc._bld_spheres._dragging
                         self._hd_grid_acc._bld_spheres.end_drag()
@@ -1421,6 +1551,9 @@ class Viz:
 
                         if self._ui.show_crosswalk and was_cw_dragging and cw_drag_idx >= 0:
                             self._hd_grid_acc.sync_crosswalk_sphere(cw_drag_idx)
+
+                        if self._ui.show_parking and was_pk_dragging and pk_drag_idx >= 0:
+                            self._hd_grid_acc.sync_parking_sphere(pk_drag_idx)
 
                         if self._ui.show_buildings and was_bld_dragging and bld_drag_idx >= 0:
                             self._hd_grid_acc.sync_building_sphere(bld_drag_idx)
@@ -1515,6 +1648,21 @@ class Viz:
                         if idx >= 0:
                             self._hd_grid_acc.sync_crosswalk_sphere(idx)
 
+                    elif self._hd_grid_acc._parking_spheres._dragging and not self._ui._live_topic_mode and self._ui.show_parking:
+                        # Drag a parking corner sphere (world space)
+                        inv_proj = np.linalg.inv(proj)
+                        inv_view = np.linalg.inv(view)
+                        cam_pos_world = inv_view[:3, 3]
+
+                        cam_pos, ray_dir = self.screen_to_world_ray(
+                            x, y, width, height,
+                            inv_proj, inv_view, cam_pos_world
+                        )
+                        self._hd_grid_acc._parking_spheres.drag(cam_pos, ray_dir)
+                        idx = self._hd_grid_acc._parking_spheres._selected_index
+                        if idx >= 0:
+                            self._hd_grid_acc.sync_parking_sphere(idx)
+
                     elif self._hd_grid_acc._bld_spheres._dragging and not self._ui._live_topic_mode and self._ui.show_buildings:
                         # Drag a building polygon sphere
                         inv_proj = np.linalg.inv(proj)
@@ -1584,6 +1732,11 @@ class Viz:
                         self._hd_grid_acc._crosswalk_pending = None
                         self._hd_grid_acc._rebuild_cw_spheres(include_pending=False)
                         self._ui._crosswalk_mode = None
+
+                    if self._ui.show_parking and glfw.get_key(self._window, glfw.KEY_ESCAPE) == glfw.PRESS:
+                        self._hd_grid_acc._parking_pending = None
+                        self._hd_grid_acc._rebuild_parking_spheres(include_pending=False)
+                        self._ui._parking_mode = None
 
                     if self._ui.show_buildings and glfw.get_key(self._window, glfw.KEY_ESCAPE) == glfw.PRESS:
                         self._hd_grid_acc._bld_spheres.end_drag()
