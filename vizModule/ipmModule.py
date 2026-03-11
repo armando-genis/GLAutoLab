@@ -579,6 +579,8 @@ class HDMapGridAccumulator:
     - Floor-based spatial binning (stable)
     - Safe bounds handling
     """
+    # Bike lanes and crosswalks stored/drawn this much above polygon plane to avoid z-fight under road
+    LAYER_OFFSET_ABOVE_POLYGON = 0.006
 
     def __init__(
         self,
@@ -1466,13 +1468,14 @@ class HDMapGridAccumulator:
         self._bike_lane_spheres.build_from_positions_direct(list(self._bike_lane_pts))
 
     def sync_bike_lane_sphere(self, sphere_index: int):
-        """Commit a moved bike-lane sphere into _bike_lane_pts (store ground-level z)."""
+        """Commit a moved bike-lane sphere into _bike_lane_pts (store above polygon plane)."""
         if self._bike_lane_pts is None:
             return
         if sphere_index < 0 or sphere_index >= len(self._bike_lane_pts):
             return
         pos = self._bike_lane_spheres._centers[sphere_index].copy()
         pos[2] -= getattr(self._bike_lane_spheres, "sphere_height", 0.40)
+        pos[2] += self.LAYER_OFFSET_ABOVE_POLYGON
         self._bike_lane_pts[sphere_index] = pos
         self._bike_lane_edited = True
 
@@ -1844,13 +1847,14 @@ class HDMapGridAccumulator:
         return result
 
     def sync_crosswalk_sphere(self, sphere_index: int):
-        """Commit the current 3-D position of a moved sphere back to _crosswalk_pts (ground-level z)."""
+        """Commit the current 3-D position of a moved sphere back to _crosswalk_pts (above polygon plane)."""
         pair_idx = sphere_index // 2
         pt_idx   = sphere_index % 2
         if pair_idx >= len(self._crosswalk_pts):
             return
         pos = self._crosswalk_spheres._centers[sphere_index].copy()
         pos[2] -= getattr(self._crosswalk_spheres, "sphere_height", 0.40)
+        pos[2] += self.LAYER_OFFSET_ABOVE_POLYGON
         self._crosswalk_pts[pair_idx][pt_idx] = pos
 
     def draw_crosswalk_spheres(self, view: np.ndarray, projection: np.ndarray, model: np.ndarray = None):
@@ -1999,6 +2003,7 @@ class HDMapGridAccumulator:
                     for corners in corners_list:
                         if path_center is not None and len(path_center) >= 2:
                             corners = _elevate_pts_to_centerline(corners, path_center)
+                            corners[:, 2] += self.LAYER_OFFSET_ABOVE_POLYGON
                         glBegin(GL_LINE_LOOP)
                         for c in corners:
                             glVertex3f(float(c[0]), float(c[1]), float(c[2]) + 0.07)
@@ -2011,6 +2016,7 @@ class HDMapGridAccumulator:
                     for tris in stripe_tris_list:
                         if path_center is not None and len(path_center) >= 2:
                             tris = _elevate_pts_to_centerline(tris, path_center)
+                            tris[:, 2] += self.LAYER_OFFSET_ABOVE_POLYGON
                         glBegin(GL_TRIANGLES)
                         for v in tris:
                             glVertex3f(float(v[0]), float(v[1]), float(v[2]))

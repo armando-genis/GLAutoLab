@@ -862,6 +862,7 @@ class Viz:
                 self._hd_grid_acc._bike_lane_pts, self._path_center
             )
             if elevated_bl is not None and len(elevated_bl) > 0:
+                elevated_bl[:, 2] += self._hd_grid_acc.LAYER_OFFSET_ABOVE_POLYGON
                 self._hd_grid_acc._bike_lane_spheres.build_from_positions_direct(list(elevated_bl))
 
         # Update crosswalk sphere positions to elevated so they sit on the same plane as the polygon
@@ -877,6 +878,7 @@ class Viz:
                 elevated_cw = self._elevate_points_to_centerline(
                     np.asarray(cw_flat, dtype=np.float32), self._path_center
                 )
+                elevated_cw[:, 2] += self._hd_grid_acc.LAYER_OFFSET_ABOVE_POLYGON
                 self._hd_grid_acc._crosswalk_spheres.build_from_positions_direct(list(elevated_cw))
 
         self._hd_grid_acc.draw_all_layers(
@@ -1214,7 +1216,7 @@ class Viz:
                                                 cl_xy = np.asarray(self._path_center)[:, :2].astype(np.float64)
                                                 cl_z = np.asarray(self._path_center)[:, 2]
                                                 d2 = np.sum((cl_xy - np.array([hit[0], hit[1]], dtype=np.float64)) ** 2, axis=1)
-                                                hit[2] = float(cl_z[np.argmin(d2)])
+                                                hit[2] = float(cl_z[np.argmin(d2)]) + self._hd_grid_acc.LAYER_OFFSET_ABOVE_POLYGON
                                             self._hd_grid_acc.add_vertex_to_bike_lane(hit)
 
                                     elif bike_lane_mode == "erase":
@@ -1259,7 +1261,7 @@ class Viz:
                                                 cl_xy = np.asarray(self._path_center)[:, :2].astype(np.float64)
                                                 cl_z = np.asarray(self._path_center)[:, 2]
                                                 d2 = np.sum((cl_xy - np.array([hit[0], hit[1]], dtype=np.float64)) ** 2, axis=1)
-                                                hit[2] = float(cl_z[np.argmin(d2)])
+                                                hit[2] = float(cl_z[np.argmin(d2)]) + self._hd_grid_acc.LAYER_OFFSET_ABOVE_POLYGON
                                             completed = self._hd_grid_acc.add_crosswalk_point(hit)
                                             if completed:
                                                 self._ui._crosswalk_mode = None
@@ -1743,9 +1745,10 @@ class Viz:
                 # IPM plane + HD grid overlays
                 self._draw_ipm_layers(view, proj)
 
-                # Loaded HD-map snapshot — independent of IPM / grid texture
+                # Loaded HD-map snapshot — independent of IPM / grid texture.
+                # Data is in world coordinates (same as JSON); use identity so z is correct.
                 if self._ui.show_hdmap_render:
-                    self._hd_map_renderer.draw(view.T, proj.T, model=self.model_floor_plane.T)
+                    self._hd_map_renderer.draw(view.T, proj.T, model=identity.T)
                     glUseProgram(self._program)  # restore main program after renderer
 
                 # Point Cloud: transformed to world space via ego-pose; labels stay at lidar origin

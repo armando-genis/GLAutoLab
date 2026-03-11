@@ -170,6 +170,18 @@ def _list_to_arr(lst) -> Optional[np.ndarray]:
     return np.array(lst, dtype=np.float32)
 
 
+def _ensure_3d(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """Ensure array is (N, 3) float32; if points are (N, 2), append z=0. Preserves existing z."""
+    if arr is None:
+        return None
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if arr.shape[1] == 2:
+        arr = np.column_stack([arr, np.zeros(len(arr), dtype=np.float32)])
+    return arr
+
+
 # ---------------------------------------------------------------------------
 # IO class
 # ---------------------------------------------------------------------------
@@ -230,26 +242,26 @@ class HDMapIO:
 
         return HDMapData(
             polygons=[
-                _list_to_arr(p)
+                _ensure_3d(_list_to_arr(p))
                 for p in payload.get("polygons", [])
                 if p is not None
             ],
-            centerline=_list_to_arr(payload.get("centerline")),
+            centerline=_ensure_3d(_list_to_arr(payload.get("centerline"))),
             bike_lane_segments=[
-                _list_to_arr(s)
+                _ensure_3d(_list_to_arr(s))
                 for s in payload.get("bike_lane_segments", [])
                 if s is not None
             ],
-            bike_lane_active=_list_to_arr(payload.get("bike_lane_active")),
+            bike_lane_active=_ensure_3d(_list_to_arr(payload.get("bike_lane_active"))),
             bike_lane_width=float(payload.get("bike_lane_width", 1.5)),
             crosswalks=[
-                _list_to_arr(c)
+                _ensure_3d(_list_to_arr(c))
                 for c in payload.get("crosswalks", [])
                 if c is not None
             ],
             crosswalk_width=float(payload.get("crosswalk_width", 3.0)),
             buildings=[
-                _list_to_arr(b)
+                _ensure_3d(_list_to_arr(b))
                 for b in payload.get("buildings", [])
                 if b is not None
             ],
@@ -403,12 +415,37 @@ def _offset_polygon_outward(pts_2d: np.ndarray, offset: float,
     return result
 
 
+# Road surface z = poly vertex z + ROAD_LIFT. Crosswalks use road z + CROSSWALK_LIFT so they draw on top.
+ROAD_LIFT = 0.001
+CROSSWALK_LIFT = 0.004   # crosswalk geometry sits this much above road to avoid z-fighting and clipping
+
+
+def _road_z_at_xy(x: float, y: float, polygons: list, road_lift: float = 0.001,
+                  extra_lift: float = 0.0) -> float:
+    """Return road surface z at (x,y) from nearest polygon vertex. extra_lift e.g. CROSSWALK_LIFT."""
+    best_z = 0.0
+    best_d2 = float("inf")
+    for poly in polygons or []:
+        if poly is None or len(poly) < 3:
+            continue
+        poly = np.asarray(poly, dtype=np.float64)
+        if poly.shape[1] < 3:
+            continue
+        for i in range(len(poly)):
+            d2 = (x - float(poly[i, 0])) ** 2 + (y - float(poly[i, 1])) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best_z = float(poly[i, 2]) + road_lift + extra_lift
+    return best_z
+
+
 def _crosswalk_rect(pt1: np.ndarray, pt2: np.ndarray,
-                    width: float) -> Optional[np.ndarray]:
+                    width: float, polygons: Optional[list] = None) -> Optional[np.ndarray]:
     """
     Compute the 4 corners of a crosswalk rectangle from its two end-centre
     points and the desired width.  Returns a (4, 3) float32 array ordered
     for ``GL_LINE_LOOP``, or ``None`` if the two points are degenerate.
+    If *polygons* is provided, z is taken from road surface at each corner (so crosswalk sits on street).
     """
     dx = float(pt2[0] - pt1[0])
     dy = float(pt2[1] - pt1[1])
@@ -417,22 +454,29 @@ def _crosswalk_rect(pt1: np.ndarray, pt2: np.ndarray,
         return None
     rx, ry = -dy / L, dx / L          # unit vector perpendicular to the axis
     hw = width * 0.5
+    if polygons:
+        z1 = _road_z_at_xy(float(pt1[0]), float(pt1[1]), polygons, extra_lift=CROSSWALK_LIFT)
+        z2 = _road_z_at_xy(float(pt2[0]), float(pt2[1]), polygons, extra_lift=CROSSWALK_LIFT)
+    else:
+        z1 = float(pt1[2]) if len(pt1) >= 3 else 0.0
+        z2 = float(pt2[2]) if len(pt2) >= 3 else 0.0
     return np.array([
-        [pt1[0] + rx * hw, pt1[1] + ry * hw, 0.0],
-        [pt1[0] - rx * hw, pt1[1] - ry * hw, 0.0],
-        [pt2[0] - rx * hw, pt2[1] - ry * hw, 0.0],
-        [pt2[0] + rx * hw, pt2[1] + ry * hw, 0.0],
+        [pt1[0] + rx * hw, pt1[1] + ry * hw, z1],
+        [pt1[0] - rx * hw, pt1[1] - ry * hw, z1],
+        [pt2[0] - rx * hw, pt2[1] - ry * hw, z2],
+        [pt2[0] + rx * hw, pt2[1] + ry * hw, z2],
     ], dtype=np.float32)
 
 
 def _crosswalk_stripe_tris(pt1: np.ndarray, pt2: np.ndarray,
-                            width: float) -> Optional[np.ndarray]:
+                            width: float, polygons: Optional[list] = None) -> Optional[np.ndarray]:
     """
     Build zebra-stripe triangle vertices for a crosswalk defined by two
     centre-line endpoints and a width.
 
     Returns a (N, 3) float32 array where N is a multiple of 3 (GL_TRIANGLES),
     or ``None`` if the points are degenerate.
+    If *polygons* is provided, z is taken from road surface at each vertex (so crosswalk sits on street).
     """
     dx = float(pt2[0] - pt1[0])
     dy = float(pt2[1] - pt1[1])
@@ -453,11 +497,24 @@ def _crosswalk_stripe_tris(pt1: np.ndarray, pt2: np.ndarray,
     for idx in range(num_stripes):
         start_t = idx * 2 * stripe_length
         end_t   = start_t + stripe_length
+        x0 = pt1[0] + ux * start_t
+        y0 = pt1[1] + uy * start_t
+        x1 = pt1[0] + ux * end_t
+        y1 = pt1[1] + uy * end_t
+        if polygons:
+            z_start = _road_z_at_xy(x0, y0, polygons, extra_lift=CROSSWALK_LIFT)
+            z_end   = _road_z_at_xy(x1, y1, polygons, extra_lift=CROSSWALK_LIFT)
+        else:
+            z1 = float(pt1[2]) if len(pt1) >= 3 else 0.0
+            z2 = float(pt2[2]) if len(pt2) >= 3 else 0.0
+            t0, t1 = start_t / L, end_t / L
+            z_start = (1.0 - t0) * z1 + t0 * z2
+            z_end   = (1.0 - t1) * z1 + t1 * z2
 
-        c0 = [pt1[0] + ux * start_t + rx * hw, pt1[1] + uy * start_t + ry * hw, 0.0]
-        c1 = [pt1[0] + ux * start_t - rx * hw, pt1[1] + uy * start_t - ry * hw, 0.0]
-        c2 = [pt1[0] + ux * end_t   - rx * hw, pt1[1] + uy * end_t   - ry * hw, 0.0]
-        c3 = [pt1[0] + ux * end_t   + rx * hw, pt1[1] + uy * end_t   + ry * hw, 0.0]
+        c0 = [x0 + rx * hw, y0 + ry * hw, z_start]
+        c1 = [x0 - rx * hw, y0 - ry * hw, z_start]
+        c2 = [x1 - rx * hw, y1 - ry * hw, z_end]
+        c3 = [x1 + rx * hw, y1 + ry * hw, z_end]
 
         # Two triangles per stripe quad
         verts.extend([c0, c1, c2, c0, c2, c3])
@@ -723,7 +780,9 @@ class HDMapRenderer:
                     0.0,
                 ], dtype=np.float32)
 
-                p = np.array([pos[0], pos[1], self.bike_icon_z], dtype=np.float32)
+                # Use lane z when available so icons sit just above the ribbon
+                icon_z = (float(pos[2]) + 0.05) if len(pos) >= 3 else self.bike_icon_z
+                p = np.array([pos[0], pos[1], icon_z], dtype=np.float32)
 
                 bl = p - r_rot * half - f_rot * half
                 br = p + r_rot * half - f_rot * half
@@ -767,7 +826,10 @@ class HDMapRenderer:
         self._cl_ribbon.width = self.cl_width
         if data.centerline is not None and len(data.centerline) >= 2:
             smooth = _catmull_rom_open(data.centerline)
-            pts = [np.array([p[0], p[1], self.lane_z], dtype=np.float32) for p in smooth]
+            pts = [
+                np.array([p[0], p[1], p[2] if len(p) >= 3 else self.lane_z], dtype=np.float32)
+                for p in smooth
+            ]
             self._cl_ribbon.update_from_positions(pts)
         else:
             self._cl_ribbon._vertex_count = 0
@@ -783,7 +845,10 @@ class HDMapRenderer:
             if seg is None or len(seg) < 2:
                 continue
             smooth = _catmull_rom_open(seg)
-            pts = [np.array([p[0], p[1], self.lane_z], dtype=np.float32) for p in smooth]
+            pts = [
+                np.array([p[0], p[1], p[2] if len(p) >= 3 else self.lane_z], dtype=np.float32)
+                for p in smooth
+            ]
             ribbon = PosePathRenderer(width=self.bl_width, outlined=True)
             ribbon.update_from_positions(pts)
             self._bl_ribbons.append(ribbon)
@@ -822,10 +887,13 @@ class HDMapRenderer:
 
         sw = self.sidewalk_width
         sh = self.sidewalk_height
+        ROAD_LIFT = 0.001  # road surface above polygon vertex; sidewalk base matches road
         for poly in data.polygons:
             if poly is None or len(poly) < 3:
                 continue
-            inner_2d = np.asarray(poly, dtype=np.float64)[:, :2]
+            poly_arr = np.asarray(poly, dtype=np.float64)
+            inner_2d = poly_arr[:, :2]
+            inner_z = poly_arr[:, 2] if poly_arr.shape[1] >= 3 else np.zeros(len(poly_arr), dtype=np.float64)
 
             # Normalise inner polygon to CCW so that inner_2d[i] and outer_2d[i]
             # are correctly paired (offset_polygon_outward reverses CW input
@@ -835,6 +903,7 @@ class HDMapRenderer:
                      + x[-1] * y[0] - x[0] * y[-1])
             if area2 < 0:
                 inner_2d = inner_2d[::-1]
+                inner_z = inner_z[::-1]
 
             outer_2d = _offset_polygon_outward(inner_2d, sw, max_miter=1.5)
             n_sw = len(inner_2d)
@@ -845,11 +914,13 @@ class HDMapRenderer:
                 j = (i + 1) % n_sw
                 A2 = inner_2d[i];  B2 = inner_2d[j]
                 C2 = outer_2d[j];  D2 = outer_2d[i]
+                # Sidewalk base at road level (poly z + ROAD_LIFT) so it matches street
+                zi, zj = float(inner_z[i]) + ROAD_LIFT, float(inner_z[j]) + ROAD_LIFT
 
-                A0 = [A2[0], A2[1], 0.0];  A1 = [A2[0], A2[1], sh]
-                B0 = [B2[0], B2[1], 0.0];  B1 = [B2[0], B2[1], sh]
-                C0 = [C2[0], C2[1], 0.0];  C1 = [C2[0], C2[1], sh]
-                D0 = [D2[0], D2[1], 0.0];  D1 = [D2[0], D2[1], sh]
+                A0 = [A2[0], A2[1], zi];  A1 = [A2[0], A2[1], zi + sh]
+                B0 = [B2[0], B2[1], zj];  B1 = [B2[0], B2[1], zj + sh]
+                C0 = [C2[0], C2[1], zj];  C1 = [C2[0], C2[1], zj + sh]
+                D0 = [D2[0], D2[1], zi];  D1 = [D2[0], D2[1], zi + sh]
 
                 # ── Top face (flat at z=sh) ────────────────────────────────
                 if np.sum((C2 - A2) ** 2) <= np.sum((D2 - B2) ** 2):
@@ -884,11 +955,21 @@ class HDMapRenderer:
             tri_pts_2d = _ear_clip_triangulate(pts[:, :2])
             if not tri_pts_2d:
                 continue
-            # Road fill at z=0.001: sits just above the ground grid to prevent
-            # z-fighting while remaining visually at ground level.
-            solid_verts = np.array(
-                [[p[0], p[1], 0.001] for p in tri_pts_2d], dtype=np.float32
-            )
+            # Road fill: per-vertex z from polygon so road follows street elevation
+            ROAD_LIFT = 0.001
+            poly_xy = np.asarray(pts[:, :2], dtype=np.float64)
+            if pts.shape[1] >= 3:
+                poly_z = np.asarray(pts[:, 2], dtype=np.float32)
+                solid_verts = []
+                for p in tri_pts_2d:
+                    d2 = np.sum((poly_xy - np.array([p[0], p[1]], dtype=np.float64)) ** 2, axis=1)
+                    z = float(poly_z[np.argmin(d2)]) + ROAD_LIFT
+                    solid_verts.append([float(p[0]), float(p[1]), z])
+                solid_verts = np.array(solid_verts, dtype=np.float32)
+            else:
+                solid_verts = np.array(
+                    [[float(p[0]), float(p[1]), ROAD_LIFT] for p in tri_pts_2d], dtype=np.float32
+                )
 
             vao = glGenVertexArrays(1)
             vbo = glGenBuffers(1)
@@ -900,9 +981,15 @@ class HDMapRenderer:
             glBindVertexArray(0)
             self._poly_solid_geom.append((int(vao), int(vbo), len(solid_verts)))
 
-            # Outline loop at same tiny z as road fill
+            # Outline loop: preserve polygon z when available, plus small lift
             outline_verts = np.asarray(poly, dtype=np.float32).copy()
-            outline_verts[:, 2] = 0.002
+            if outline_verts.shape[1] >= 3:
+                outline_verts[:, 2] = outline_verts[:, 2] + 0.002
+            else:
+                outline_verts = np.column_stack([
+                    outline_verts,
+                    np.full(len(outline_verts), 0.002, dtype=np.float32)
+                ])
             vao = glGenVertexArrays(1)
             vbo = glGenBuffers(1)
             glBindVertexArray(vao)
@@ -990,8 +1077,8 @@ class HDMapRenderer:
                 continue
             cw = np.asarray(cw, dtype=np.float32)
 
-            # Outline
-            corners = _crosswalk_rect(cw[0], cw[1], cw_width)
+            # Outline — snap z to road surface so crosswalk sits on street
+            corners = _crosswalk_rect(cw[0], cw[1], cw_width, polygons=data.polygons)
             if corners is not None:
                 vao = glGenVertexArrays(1)
                 vbo = glGenBuffers(1)
@@ -1003,8 +1090,8 @@ class HDMapRenderer:
                 glBindVertexArray(0)
                 self._cw_geom.append((int(vao), int(vbo), 4))
 
-            # Zebra stripes
-            stripe_verts = _crosswalk_stripe_tris(cw[0], cw[1], cw_width)
+            # Zebra stripes — snap z to road surface so crosswalk sits on street
+            stripe_verts = _crosswalk_stripe_tris(cw[0], cw[1], cw_width, polygons=data.polygons)
             if stripe_verts is not None:
                 vao = glGenVertexArrays(1)
                 vbo = glGenBuffers(1)
@@ -1109,9 +1196,9 @@ class HDMapRenderer:
                 glDrawArrays(GL_LINE_STRIP, 0, count)
             glLineWidth(1.0)
 
-        # ── Crosswalk zebra stripes and outlines ──────────────────────────
+        # ── Crosswalk zebra stripes and outlines (z already baked; no extra lift) ──
         if self._cw_stripe_geom or self._cw_geom:
-            glUniform1f(self._loc_z_lift, self.crosswalk_z)
+            glUniform1f(self._loc_z_lift, 0.0)
 
         if self._cw_stripe_geom:
             glUniform4f(self._loc_color, 1.0, 1.0, 1.0, 0.9)
@@ -1127,9 +1214,6 @@ class HDMapRenderer:
                 glBindVertexArray(vao)
                 glDrawArrays(GL_LINE_LOOP, 0, count)
             glLineWidth(1.0)
-
-        if self._cw_stripe_geom or self._cw_geom:
-            glUniform1f(self._loc_z_lift, 0.0)
 
         glBindVertexArray(0)
         glLineWidth(1.0)
